@@ -1,0 +1,28 @@
+{
+  "name": "reality64",
+  "version": "0.1.0",
+  "description": "Nintendo 64 Emulator written in C++",
+  "main": "source/Main.cpp",
+  "scripts": {
+    "build": "cmake -B build && cmake --build build",
+    "clean": "rm -rf build",
+    "start": "cmake --build build && ./build/Reality64"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Reality64Crew/Reality64.git"
+  },
+  "keywords": [
+    "n64",
+    "emulator",
+    "cpp",
+    "nintendo64",
+    "mips"
+  ],
+  "author": "Reality64Crew",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/Reality64Crew/Reality64/issues"
+  },
+  "homepage": "https://github.com/Reality64Crew/Reality64#readme"
+}
