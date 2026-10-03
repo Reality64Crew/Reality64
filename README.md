@@ -48,15 +48,22 @@ On Linux install SDL's build dependencies first (X11/Wayland, ALSA/PulseAudio, u
 
 ## Running
 
+Double-click `Reality64` (or run it with no arguments) to open the menu: pick a ROM
+with the file dialog, or drag a ROM file onto the window. The menu works with the
+keyboard (arrows, Enter, Esc) and with a gamepad (D-pad, A). There is also a
+Controls screen that lists the default bindings.
+
 ```sh
-Reality64 game.z64                      # open a window and play
+Reality64                               # open the menu
+Reality64 game.z64                      # play straight away
 Reality64 --info game.z64               # print the ROM header
 Reality64 --headless --frames 60 --screenshot out.ppm game.z64
 Reality64 --headless --steps 100000 game.z64   # run N instructions, dump registers
 Reality64 --trace game.z64              # print every executed instruction
 ```
 
-Window keys: `Esc` quit, `P` pause, `F11` fullscreen.
+Window keys: `Esc` back to the menu (and quit from the menu), `P` pause, `F11` fullscreen.
+If the emulated CPU hits something unsupported, the reason is shown on screen.
 
 ## Controls
 

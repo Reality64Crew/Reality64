@@ -12,6 +12,11 @@
 
 #ifdef REALITY64_SDL
 #include "frontend/SdlFrontend.h"
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#endif
 #endif
 
 #ifndef REALITY64_VERSION
@@ -40,7 +45,13 @@ void printUsage(const char* argv0) {
     std::printf(
         "Reality64 %s - Nintendo 64 emulator\n"
         "\n"
+#ifdef REALITY64_SDL
+        "Usage: %s [options] [rom.z64|rom.v64|rom.n64]\n"
+        "\n"
+        "With no ROM, a menu opens where you can pick one.\n"
+#else
         "Usage: %s [options] <rom.z64|rom.v64|rom.n64>\n"
+#endif
         "\n"
         "Options:\n"
 #ifdef REALITY64_SDL
@@ -58,7 +69,7 @@ void printUsage(const char* argv0) {
         "  -h, --help           show this help\n"
 #ifdef REALITY64_SDL
         "\n"
-        "Window keys: Esc quit, P pause, F11 fullscreen.\n"
+        "Window keys: Esc back to the menu (quit from the menu), P pause, F11 fullscreen.\n"
 #endif
         ,
         REALITY64_VERSION, argv0, DefaultMaxSteps);
@@ -169,12 +180,19 @@ int parseArgs(int argc, char* argv[], Options& opt) {
             return 1;
         }
     }
-    if (opt.romPath.empty()) {
-        printUsage(argv[0]);
-        return 1;
-    }
     return -1;
 }
+
+#if defined(REALITY64_SDL) && defined(_WIN32)
+// When the program is started by double-clicking it, Windows gives it a console
+// of its own that would sit behind the window. If we are the only process
+// attached to the console, nobody is reading it, so drop it. Started from a
+// terminal, the console is shared and stays.
+void detachOwnConsole() {
+    DWORD processes[2];
+    if (GetConsoleProcessList(processes, 2) <= 1) FreeConsole();
+}
+#endif
 
 void loadInputConfig(reality64::InputMapper& input, const std::string& explicitPath) {
     const std::string path = explicitPath.empty() ? "input.cfg" : explicitPath;
@@ -202,6 +220,27 @@ int main(int argc, char* argv[]) {
     }
 #endif
 
+    reality64::InputMapper input;
+    loadInputConfig(input, opt.inputConfig);
+
+#ifdef REALITY64_SDL
+    // The windowed app: with no ROM it opens on a menu instead of exiting.
+    if (!opt.headless && !opt.infoOnly) {
+#ifdef _WIN32
+        detachOwnConsole();
+#endif
+        reality64::FrontendOptions fo;
+        fo.frameLimit = !opt.noLimit;
+        fo.fullscreen = opt.fullscreen;
+        return reality64::runSdlFrontend(input, fo, opt.romPath);
+    }
+#endif
+
+    if (opt.romPath.empty()) {
+        printUsage(argv[0]);
+        return 1;
+    }
+
     reality64::Emulator emu;
     std::string error;
     if (!emu.loadRom(opt.romPath, error)) {
@@ -211,23 +250,12 @@ int main(int argc, char* argv[]) {
     printHeader(*emu.rom());
     if (opt.infoOnly) return 0;
 
-    reality64::InputMapper input;
-    loadInputConfig(input, opt.inputConfig);
     emu.bus().setControllerProvider([&input](int port) { return input.state(port); });
 
     if (!emu.boot(error)) {
         std::fprintf(stderr, "error: %s\n", error.c_str());
         return 1;
     }
-
-#ifdef REALITY64_SDL
-    if (!opt.headless) {
-        reality64::FrontendOptions fo;
-        fo.frameLimit = !opt.noLimit;
-        fo.fullscreen = opt.fullscreen;
-        return reality64::runSdlFrontend(emu, input, fo);
-    }
-#endif
 
     if (opt.trace) {
         emu.cpu().setTraceHook([](uint64_t pc, uint32_t instr) {

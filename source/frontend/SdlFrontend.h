@@ -1,6 +1,7 @@
 #pragma once
 
-#include "core/Emulator.h"
+#include <string>
+
 #include "input/InputMapper.h"
 
 namespace reality64 {
@@ -10,9 +11,11 @@ struct FrontendOptions {
     bool fullscreen = false;
 };
 
-// Runs a booted emulator in an SDL window with video, audio and keyboard /
-// gamepad input until the user quits. Returns a process exit code: 0 on a
-// normal quit, 2 if the emulated CPU halted on an unsupported operation.
-int runSdlFrontend(Emulator& emu, InputMapper& input, const FrontendOptions& options);
+// Runs the Reality64 application: a window with a menu (open a ROM, controls,
+// quit) that plays games with video, audio and keyboard / gamepad input.
+// `romPath` may be empty; if it is given the game starts straight away.
+// Returns a process exit code (0 on a normal quit, 1 if the window could not be
+// created).
+int runSdlFrontend(InputMapper& input, const FrontendOptions& options, const std::string& romPath);
 
 }  // namespace reality64
