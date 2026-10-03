@@ -42,6 +42,15 @@ endif()
 
 add_executable(Reality64 source/Main.cpp)
 target_link_libraries(Reality64 PRIVATE reality64_core)
+
+# Windows: the icon shown by Explorer and the taskbar lives in the executable.
+if(WIN32)
+    enable_language(RC)
+    set(REALITY64_RC "${CMAKE_BINARY_DIR}/generated/Reality64.rc")
+    file(WRITE "${REALITY64_RC}" "1 ICON \"${CMAKE_SOURCE_DIR}/assets/icon.ico\"\n")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/assets/icon.ico")
+    target_sources(Reality64 PRIVATE "${REALITY64_RC}")
+endif()
 target_compile_definitions(Reality64 PRIVATE REALITY64_VERSION="${PROJECT_VERSION}")
 
 if(REALITY64_ENABLE_SDL)
@@ -64,7 +73,21 @@ if(REALITY64_ENABLE_SDL)
         FetchContent_MakeAvailable(SDL3)
     endif()
 
-    target_sources(Reality64 PRIVATE source/frontend/SdlFrontend.cpp)
+    # Embed the window icon in the binary so it works without loose files.
+    set(REALITY64_ICON_PNG "${CMAKE_SOURCE_DIR}/assets/icon-256.png")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${REALITY64_ICON_PNG}")
+    file(READ "${REALITY64_ICON_PNG}" REALITY64_ICON_HEX HEX)
+    string(LENGTH "${REALITY64_ICON_HEX}" REALITY64_ICON_HEX_LEN)
+    math(EXPR REALITY64_ICON_SIZE "${REALITY64_ICON_HEX_LEN} / 2")
+    string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," REALITY64_ICON_BYTES "${REALITY64_ICON_HEX}")
+    file(WRITE "${CMAKE_BINARY_DIR}/generated/AppIcon.cpp"
+        "#include \"frontend/AppIcon.h\"\n"
+        "const unsigned char kAppIconPng[] = {${REALITY64_ICON_BYTES}};\n"
+        "const unsigned long kAppIconPngSize = ${REALITY64_ICON_SIZE};\n")
+
+    target_sources(Reality64 PRIVATE
+        source/frontend/SdlFrontend.cpp
+        "${CMAKE_BINARY_DIR}/generated/AppIcon.cpp")
     target_compile_definitions(Reality64 PRIVATE REALITY64_SDL=1)
     if(TARGET SDL3::SDL3)
         target_link_libraries(Reality64 PRIVATE SDL3::SDL3)

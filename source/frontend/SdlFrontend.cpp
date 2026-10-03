@@ -2,6 +2,8 @@
 
 #include <SDL3/SDL.h>
 
+#include "frontend/AppIcon.h"
+
 #include <cstdio>
 #include <map>
 #include <string>
@@ -68,6 +70,14 @@ bool Frontend::init() {
     if (!window_) {
         std::fprintf(stderr, "error: cannot create window: %s\n", SDL_GetError());
         return false;
+    }
+    if (SDL_IOStream* io = SDL_IOFromConstMem(kAppIconPng, static_cast<size_t>(kAppIconPngSize))) {
+        if (SDL_Surface* icon = SDL_LoadPNG_IO(io, true)) {
+            SDL_SetWindowIcon(window_, icon);
+            SDL_DestroySurface(icon);
+        } else {
+            std::fprintf(stderr, "warning: cannot load the window icon: %s\n", SDL_GetError());
+        }
     }
     renderer_ = SDL_CreateRenderer(window_, nullptr);
     if (!renderer_) {
