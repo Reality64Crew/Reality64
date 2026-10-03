@@ -1,0 +1,58 @@
+# Reality64 input configuration.
+#
+# Copy this file to "input.cfg" next to the executable (or pass --input-config).
+# Every line is `key.<Action> = <inputs>` for the keyboard or
+# `pad.<Action> = <inputs>` for gamepads. Inputs are comma separated, and an
+# action you list here replaces its default binding. An empty list unbinds it.
+#
+# Actions: A B Z Start L R DUp DDown DLeft DRight CUp CDown CLeft CRight
+#          StickUp StickDown StickLeft StickRight
+#
+# Keyboard inputs are physical key names: letters (A..Z), digits, Up, Down,
+# Left, Right, Return, Space, Left Shift, Right Ctrl, Keypad 8, F1, ...
+#
+# Gamepad inputs are SDL button names: a b x y back start leftstick rightstick
+# leftshoulder rightshoulder dpup dpdown dpleft dpright misc1 paddle1 ...
+# An axis can act as a button: +name is "pushed positive", -name is "pushed
+# negative" (e.g. +lefttrigger, -righty, +rightx).
+
+# --- Keyboard defaults ------------------------------------------------------
+key.A          = X
+key.B          = C
+key.Z          = Z
+key.Start      = Return
+key.L          = A
+key.R          = S
+key.DUp        = T
+key.DDown      = G
+key.DLeft      = F
+key.DRight     = H
+key.CUp        = I
+key.CDown      = K
+key.CLeft      = J
+key.CRight     = L
+key.StickUp    = Up
+key.StickDown  = Down
+key.StickLeft  = Left
+key.StickRight = Right
+
+# --- Gamepad defaults -------------------------------------------------------
+pad.A          = a
+pad.B          = x
+pad.Z          = +lefttrigger
+pad.Start      = start
+pad.L          = leftshoulder
+pad.R          = rightshoulder, +righttrigger
+pad.DUp        = dpup
+pad.DDown      = dpdown
+pad.DLeft      = dpleft
+pad.DRight     = dpright
+pad.CUp        = -righty
+pad.CDown      = +righty
+pad.CLeft      = -rightx
+pad.CRight     = +rightx
+
+# Analog stick axes and the radial deadzone (0 .. 0.9).
+pad.StickX     = leftx
+pad.StickY     = lefty
+pad.Deadzone   = 0.15

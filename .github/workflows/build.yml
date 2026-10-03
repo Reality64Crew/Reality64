@@ -1,0 +1,139 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # Windows, Linux and macOS: build (with the SDL3 window/audio/gamepad
+  # frontend, linked statically), run the unit tests, package the binary.
+  desktop:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows (x64)
+            os: windows-latest
+            artifact: Reality64-windows-x64
+            cmake_args: -A x64
+          - name: Linux (x64)
+            os: ubuntu-latest
+            artifact: Reality64-linux-x64
+            cmake_args: ''
+          - name: macOS (universal)
+            os: macos-latest
+            artifact: Reality64-macos-universal
+            cmake_args: -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0
+    steps:
+      - uses: actions/checkout@v4
+
+      # Packages SDL3 needs to build its X11/Wayland, audio and joystick backends.
+      - name: Install SDL build dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config \
+            libasound2-dev libpulse-dev \
+            libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxfixes-dev libxi-dev libxss-dev libxtst-dev \
+            libxkbcommon-dev libwayland-dev wayland-protocols libdecor-0-dev \
+            libdrm-dev libgbm-dev libgl1-mesa-dev libgles2-mesa-dev libegl1-mesa-dev \
+            libdbus-1-dev libudev-dev
+
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release ${{ matrix.cmake_args }}
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: Package
+        run: cmake --install build --config Release --prefix dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/
+          if-no-files-found: error
+
+  # Native command-line binary for each Android ABI, built with the NDK that
+  # ships on the runner. Headless: SDL needs a Java app wrapper on Android, so
+  # the frontend is left to that wrapper, which can drive the platform-neutral
+  # InputMapper. Tests are skipped: the binaries can't run on the host.
+  android:
+    name: Android (${{ matrix.abi }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        abi: [arm64-v8a, armeabi-v7a, x86_64, x86]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: |
+          NDK="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_ROOT}"
+          cmake -B build \
+            -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=${{ matrix.abi }} \
+            -DANDROID_PLATFORM=android-24 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DREALITY64_ENABLE_SDL=OFF \
+            -DREALITY64_BUILD_TESTS=OFF
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Package
+        run: cmake --install build --prefix dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Reality64-android-${{ matrix.abi }}
+          path: dist/
+          if-no-files-found: error
+
+  # Unsigned arm64 device build, headless for the same reason as Android.
+  # Wrapping it in an app bundle (and signing it) is left to the frontend.
+  ios:
+    name: iOS (arm64)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: |
+          cmake -B build \
+            -DCMAKE_SYSTEM_NAME=iOS \
+            -DCMAKE_OSX_SYSROOT=iphoneos \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0 \
+            -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DREALITY64_ENABLE_SDL=OFF \
+            -DREALITY64_BUILD_TESTS=OFF
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Package
+        run: cmake --install build --prefix dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Reality64-ios-arm64
+          path: dist/
+          if-no-files-found: error
