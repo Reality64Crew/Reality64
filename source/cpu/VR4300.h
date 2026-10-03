@@ -5,11 +5,11 @@
 #include <functional>
 #include <string>
 
+#include "core/MemoryBus.h"
+#include "core/StateIO.h"
 #include "cpu/CpuCommon.h"
 
 namespace reality64 {
-
-class MemoryBus;
 
 // NEC VR4300 (MIPS III) interpreter.
 //
@@ -47,6 +47,11 @@ public:
     // Executes up to maxInstructions and returns how many completed; stops early
     // if the CPU halts. Faster than calling step() in a loop.
     uint64_t run(uint64_t maxInstructions);
+    // How many CPU clock cycles one instruction is charged for when advancing
+    // Count/Compare. The real pipeline averages well over one cycle per
+    // instruction once cache misses and RDRAM latency are included.
+    void setCyclesPerInstruction(unsigned cycles) { cyclesPerInstruction_ = cycles ? cycles : 1; }
+    unsigned cyclesPerInstruction() const { return cyclesPerInstruction_; }
 
     bool halted() const { return halted_; }
     const std::string& haltReason() const { return haltReason_; }
@@ -65,6 +70,10 @@ public:
     uint32_t fcsr() const { return fcsr_; }
     uint64_t instructionCount() const { return instructionCount_; }
 
+    void saveState(StateWriter& w) const;
+    // Restores what saveState() wrote. Check r.ok() afterwards.
+    void loadState(StateReader& r);
+
 private:
     enum class Access { Fetch, Load, Store };
 
@@ -77,10 +86,11 @@ private:
     };
 
     void executeOne();
-    bool serviceTimersAndInterrupts(uint64_t instructions);
+    bool serviceTimersAndInterrupts(uint64_t cycles);
     uint32_t randomValue() const;
 
     void execute(uint32_t instr);
+    void executeSlow(uint32_t instr);
     void executeSpecial(uint32_t instr);
     void executeRegimm(uint32_t instr);
     void executeCop0(uint32_t instr);
@@ -89,8 +99,26 @@ private:
 
     bool translate(uint64_t vaddr, Access access, uint32_t& paddr);
     bool translateTlb(uint64_t vaddr, Access access, uint32_t& paddr);
-    bool readMem(uint64_t vaddr, unsigned size, uint64_t& value);
-    bool writeMem(uint64_t vaddr, unsigned size, uint64_t value);
+    // Aligned accesses to KSEG0/KSEG1 (nearly all of them) go straight to the
+    // bus; anything else takes the slow path (alignment errors, the TLB).
+    bool readMem(uint64_t vaddr, unsigned size, uint64_t& value) {
+        const uint32_t a = static_cast<uint32_t>(vaddr);
+        if ((a & 0xC0000000u) == 0x80000000u && vaddr == cpu::sx32(a) && (a & (size - 1)) == 0) {
+            value = bus_.read(a & 0x1FFFFFFFu, size);
+            return true;
+        }
+        return readMemSlow(vaddr, size, value);
+    }
+    bool writeMem(uint64_t vaddr, unsigned size, uint64_t value) {
+        const uint32_t a = static_cast<uint32_t>(vaddr);
+        if ((a & 0xC0000000u) == 0x80000000u && vaddr == cpu::sx32(a) && (a & (size - 1)) == 0) {
+            bus_.write(a & 0x1FFFFFFFu, size, value);
+            return true;
+        }
+        return writeMemSlow(vaddr, size, value);
+    }
+    bool readMemSlow(uint64_t vaddr, unsigned size, uint64_t& value);
+    bool writeMemSlow(uint64_t vaddr, unsigned size, uint64_t value);
 
     void tlbRead();
     void tlbWrite(unsigned index);
@@ -129,6 +157,7 @@ private:
     bool halted_ = false;
     std::string haltReason_;
     uint64_t instructionCount_ = 0;
+    unsigned cyclesPerInstruction_ = 1;
     TraceHook traceHook_;
 };
 

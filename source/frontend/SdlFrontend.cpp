@@ -3,8 +3,11 @@
 #include <SDL3/SDL.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cstdio>
-#include <cstring>
+#include <ctime>
+#include <fstream>
+#include <iterator>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -12,6 +15,7 @@
 #include <vector>
 
 #include "core/Emulator.h"
+#include "core/Settings.h"
 #include "frontend/AppIcon.h"
 
 namespace reality64 {
@@ -20,8 +24,11 @@ namespace {
 
 constexpr int LogicalWidth = 640;
 constexpr int LogicalHeight = 480;
+constexpr Uint64 MenuInputGraceMs = 600;
+constexpr unsigned MaxRecentShown = 4;
+constexpr int FastForwardFrames = 4;
 
-enum class Screen { Menu, Controls, Playing };
+enum class Screen { Menu, Settings, Controls, Playing };
 
 struct Color {
     Uint8 r, g, b;
@@ -31,88 +38,29 @@ constexpr Color Dim{140, 140, 155};
 constexpr Color Accent{255, 214, 64};
 constexpr Color Error{255, 96, 96};
 constexpr Color Notice{120, 200, 255};
+constexpr Color Good{120, 230, 140};
 
-const char* const MenuItems[] = {"Open ROM...", "Controls", "Quit"};
-constexpr int MenuItemCount = 3;
-constexpr Uint64 MenuInputGraceMs = 600;
-
-class App {
-public:
-    App(InputMapper& input, const FrontendOptions& options) : input_(input), options_(options) {}
-    ~App() { shutdown(); }
-
-    bool init();
-    int run(const std::string& romPath);
-
-private:
-    // setup / teardown
-    void shutdown();
-    void loadControllerDatabase();
-
-    // events
-    void pumpEvents();
-    void handleKey(const SDL_KeyboardEvent& key);
-    void handleGamepadButton(const SDL_GamepadButtonEvent& button);
-    void menuKey(SDL_Scancode scancode);
-    // The key that launched the program (Enter in a terminal or Explorer) can
-    // arrive at the new window; ignore menu input briefly after it appears or
-    // regains focus so that it doesn't activate an item by accident.
-    void blockMenuInput() { menuBlockedUntil_ = SDL_GetTicks() + MenuInputGraceMs; }
-    bool menuInputBlocked() const { return SDL_GetTicks() < menuBlockedUntil_; }
-    void activateMenuItem(int index);
-    void openGamepad(SDL_JoystickID id);
-    void closeGamepad(SDL_JoystickID id);
-    void addGenericMapping(SDL_JoystickID id);
-    void pollFileDialog();
-    void showFileDialog();
-    static void SDLCALL onFileChosen(void* userdata, const char* const* files, int filter);
-
-    // game lifecycle
-    bool startGame(const std::string& path);
-    void stopGame();
-    void onAudio(const uint8_t* samples, uint32_t bytes, uint32_t rate);
-
-    // drawing
-    void text(float x, float y, float scale, Color color, const std::string& s);
-    void centeredText(float y, float scale, Color color, const std::string& s);
-    void drawMenu();
-    void drawControls();
-    void drawGame();
-    void drawMessage(float y);
-    void updateTitle(double fps);
-
-    InputMapper& input_;
-    FrontendOptions options_;
-
-    SDL_Window* window_ = nullptr;
-    SDL_Renderer* renderer_ = nullptr;
-    SDL_Texture* texture_ = nullptr;      // game frame
-    SDL_Texture* iconTexture_ = nullptr;  // logo on the menu
-    int textureWidth_ = 0;
-    int textureHeight_ = 0;
-    SDL_AudioStream* audio_ = nullptr;
-    uint32_t audioRate_ = 0;
-    std::map<SDL_JoystickID, SDL_Gamepad*> gamepads_;
-
-    std::unique_ptr<Emulator> game_;
-    VideoFrame frame_;
-    Screen screen_ = Screen::Menu;
-    int selected_ = 0;
-    Uint64 menuBlockedUntil_ = 0;
-    bool running_ = true;
-    bool paused_ = false;
-    bool haltReported_ = false;
-    bool fullscreen_ = false;
-
-    std::string message_;
-    bool messageIsError_ = false;
-
-    // The file dialog may call back from another thread.
-    std::mutex dialogMutex_;
-    bool dialogOpen_ = false;
-    std::string dialogResult_;
-    std::string dialogError_;
+struct MenuEntry {
+    enum Kind { Open, Recent, Settings, Controls, Quit } kind;
+    int recentIndex;
+    std::string label;
 };
+
+enum SettingsRow { RowForce60, RowCpu, RowSmooth, RowVolume, RowFullscreen, RowBack, SettingsRowCount };
+
+std::string baseName(const std::string& path) {
+    const size_t slash = path.find_last_of("/\\");
+    std::string name = slash == std::string::npos ? path : path.substr(slash + 1);
+    const size_t dot = name.find_last_of('.');
+    if (dot != std::string::npos && dot > 0) name.erase(dot);
+    return name;
+}
+
+std::string safeFileName(const std::string& s) {
+    std::string out;
+    for (char c : s) out += (std::isalnum(static_cast<unsigned char>(c)) || c == '-' || c == '_') ? c : '_';
+    return out.empty() ? "game" : out;
+}
 
 float normalizeAxis(Sint16 value) {
     return value < 0 ? static_cast<float>(value) / 32768.0f : static_cast<float>(value) / 32767.0f;
@@ -144,11 +92,116 @@ std::vector<std::string> wrap(const std::string& s, size_t width) {
     return lines;
 }
 
+std::string truncate(const std::string& s, size_t width) {
+    return s.size() <= width ? s : s.substr(0, width - 3) + "...";
+}
+
+class App {
+public:
+    App(InputMapper& input, const FrontendOptions& options) : input_(input), options_(options) {}
+    ~App() { shutdown(); }
+
+    bool init();
+    int run(const std::string& romPath);
+
+private:
+    // setup / teardown
+    void shutdown();
+    void loadControllerDatabase();
+    void loadSettings();
+    void saveSettings();
+    void applyAudioVolume();
+
+    // events
+    void pumpEvents();
+    void handleKey(const SDL_KeyboardEvent& key);
+    void handleGamepadButton(const SDL_GamepadButtonEvent& button);
+    void menuKey(SDL_Scancode scancode);
+    void settingsKey(SDL_Scancode scancode);
+    void activateMenuEntry(int index);
+    void adjustSetting(int row, int direction);
+    void openGamepad(SDL_JoystickID id);
+    void closeGamepad(SDL_JoystickID id);
+    void addGenericMapping(SDL_JoystickID id);
+    void pollFileDialog();
+    void showFileDialog();
+    static void SDLCALL onFileChosen(void* userdata, const char* const* files, int filter);
+    void blockMenuInput() { menuBlockedUntil_ = SDL_GetTicks() + MenuInputGraceMs; }
+    bool menuInputBlocked() const { return SDL_GetTicks() < menuBlockedUntil_; }
+
+    // game lifecycle and features
+    bool startGame(const std::string& path);
+    void stopGame();
+    void onAudio(const uint8_t* samples, uint32_t bytes, uint32_t rate);
+    std::string statePath() const;
+    void saveState();
+    void loadState();
+    void takeScreenshot();
+    void showToast(const std::string& text, Color color = Good);
+
+    // drawing
+    void buildMenu();
+    void text(float x, float y, float scale, Color color, const std::string& s);
+    void centeredText(float y, float scale, Color color, const std::string& s);
+    void drawMenu();
+    void drawSettings();
+    void drawControls();
+    void drawGame();
+    void drawMessage(float y);
+    void updateTitle(double fps);
+
+    InputMapper& input_;
+    FrontendOptions options_;
+    Settings settings_;
+    std::string prefPath_;
+
+    SDL_Window* window_ = nullptr;
+    SDL_Renderer* renderer_ = nullptr;
+    SDL_Texture* texture_ = nullptr;      // game frame
+    SDL_Texture* iconTexture_ = nullptr;  // logo on the menu
+    int textureWidth_ = 0;
+    int textureHeight_ = 0;
+    SDL_AudioStream* audio_ = nullptr;
+    uint32_t audioRate_ = 0;
+    std::map<SDL_JoystickID, SDL_Gamepad*> gamepads_;
+
+    std::unique_ptr<Emulator> game_;
+    std::string gamePath_;
+    VideoFrame frame_;
+    Screen screen_ = Screen::Menu;
+    std::vector<MenuEntry> menu_;
+    int selected_ = 0;
+    int settingsSelected_ = 0;
+    Uint64 menuBlockedUntil_ = 0;
+    bool running_ = true;
+    bool paused_ = false;
+    bool fastForward_ = false;
+    bool haltReported_ = false;
+    bool fullscreen_ = false;
+
+    std::string message_;
+    bool messageIsError_ = false;
+    std::string toast_;
+    Color toastColor_ = Good;
+    Uint64 toastUntil_ = 0;
+
+    // The file dialog may call back from another thread.
+    std::mutex dialogMutex_;
+    bool dialogOpen_ = false;
+    std::string dialogResult_;
+    std::string dialogError_;
+};
+
+// ---------------------------------------------------------------------------
+// Setup
+// ---------------------------------------------------------------------------
+
 bool App::init() {
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) {
         std::fprintf(stderr, "error: cannot initialise SDL: %s\n", SDL_GetError());
         return false;
     }
+    loadSettings();
 
     window_ = SDL_CreateWindow("Reality64", LogicalWidth, LogicalHeight, SDL_WINDOW_RESIZABLE);
     if (!window_) {
@@ -174,10 +227,9 @@ bool App::init() {
         }
     }
 
-    if (options_.fullscreen) {
-        fullscreen_ = true;
-        SDL_SetWindowFullscreen(window_, true);
-    }
+    if (options_.fullscreen) settings_.fullscreen = true;
+    fullscreen_ = settings_.fullscreen;
+    if (fullscreen_) SDL_SetWindowFullscreen(window_, true);
 
     // Audio is optional: carry on silently if there is no output device.
     if (SDL_InitSubSystem(SDL_INIT_AUDIO)) {
@@ -187,6 +239,7 @@ bool App::init() {
         spec.freq = 44100;
         audio_ = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, nullptr, nullptr);
         if (audio_) {
+            applyAudioVolume();
             SDL_ResumeAudioStreamDevice(audio_);
             audioRate_ = 44100;
         } else {
@@ -195,6 +248,7 @@ bool App::init() {
     }
 
     loadControllerDatabase();
+    buildMenu();
     return true;
 }
 
@@ -222,6 +276,31 @@ void App::loadControllerDatabase() {
     if (const char* base = SDL_GetBasePath()) path = std::string(base) + path;
     const int added = SDL_AddGamepadMappingsFromFile(path.c_str());
     if (added > 0) std::fprintf(stderr, "Loaded %d gamepad mappings from %s\n", added, path.c_str());
+}
+
+void App::loadSettings() {
+    if (char* pref = SDL_GetPrefPath("Reality64Crew", "Reality64")) {
+        prefPath_ = pref;
+        SDL_free(pref);
+    }
+    if (prefPath_.empty()) return;
+
+    std::ifstream f(prefPath_ + "settings.cfg", std::ios::binary);
+    if (!f) return;
+    const std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    std::vector<std::string> errors;
+    settings_.parse(text, errors);
+    for (const std::string& e : errors) std::fprintf(stderr, "settings.cfg: %s\n", e.c_str());
+}
+
+void App::saveSettings() {
+    if (prefPath_.empty()) return;
+    std::ofstream f(prefPath_ + "settings.cfg", std::ios::binary | std::ios::trunc);
+    if (f) f << settings_.serialize();
+}
+
+void App::applyAudioVolume() {
+    if (audio_) SDL_SetAudioStreamGain(audio_, static_cast<float>(settings_.volume) / 100.0f);
 }
 
 // ---------------------------------------------------------------------------
@@ -268,13 +347,28 @@ void App::addGenericMapping(SDL_JoystickID id) {
 }
 
 // ---------------------------------------------------------------------------
-// Game lifecycle
+// Game lifecycle and features
 // ---------------------------------------------------------------------------
 
 bool App::startGame(const std::string& path) {
     auto emu = std::make_unique<Emulator>();
     std::string error;
-    if (!emu->loadRom(path, error) || !emu->boot(error)) {
+    if (!emu->loadRom(path, error)) {
+        message_ = "Could not open that ROM: " + error;
+        messageIsError_ = true;
+        settings_.removeRecent(path);
+        saveSettings();
+        buildMenu();
+        return false;
+    }
+
+    // Command-line options win over the saved settings.
+    const unsigned cpi = options_.cyclesPerInstruction ? options_.cyclesPerInstruction : settings_.cyclesPerInstruction;
+    const bool force60 = options_.force60 >= 0 ? options_.force60 != 0 : settings_.force60;
+    emu->setCyclesPerInstruction(cpi);
+    emu->setForcedRefresh(force60 ? 60 : 0);
+
+    if (!emu->boot(error)) {
         message_ = "Could not start that ROM: " + error;
         messageIsError_ = true;
         return false;
@@ -287,11 +381,17 @@ bool App::startGame(const std::string& path) {
     }
 
     game_ = std::move(emu);
+    gamePath_ = path;
     input_.releaseAll();
     screen_ = Screen::Playing;
     paused_ = false;
+    fastForward_ = false;
     haltReported_ = false;
     message_.clear();
+
+    settings_.addRecent(path);
+    saveSettings();
+    buildMenu();
     return true;
 }
 
@@ -301,9 +401,11 @@ void App::stopGame() {
     input_.releaseAll();
     screen_ = Screen::Menu;
     SDL_SetWindowTitle(window_, "Reality64");
+    blockMenuInput();
 }
 
 void App::onAudio(const uint8_t* samples, uint32_t bytes, uint32_t rate) {
+    if (fastForward_) return;  // sped-up sound is just noise
     if (rate != audioRate_) {
         SDL_AudioSpec spec;
         spec.format = SDL_AUDIO_S16BE;
@@ -315,6 +417,84 @@ void App::onAudio(const uint8_t* samples, uint32_t bytes, uint32_t rate) {
     // Keep latency bounded: if more than half a second is already queued, drop.
     if (SDL_GetAudioStreamQueued(audio_) > static_cast<int>(rate * 2)) return;
     SDL_PutAudioStreamData(audio_, samples, static_cast<int>(bytes));
+}
+
+void App::showToast(const std::string& text, Color color) {
+    toast_ = text;
+    toastColor_ = color;
+    toastUntil_ = SDL_GetTicks() + 2500;
+}
+
+// One save state slot per game, kept in the per-user data folder.
+std::string App::statePath() const {
+    if (prefPath_.empty() || !game_ || !game_->rom()) return {};
+    const RomHeader& h = game_->rom()->header();
+    char crc[24];
+    std::snprintf(crc, sizeof crc, "_%08X%08X", h.crc1, h.crc2);
+    return prefPath_ + "states/" + safeFileName(h.name) + crc + ".state";
+}
+
+void App::saveState() {
+    const std::string path = statePath();
+    if (path.empty()) {
+        showToast("No place to save states", Error);
+        return;
+    }
+    SDL_CreateDirectory((prefPath_ + "states").c_str());
+    const std::vector<uint8_t> data = game_->saveState();
+    std::ofstream f(path, std::ios::binary | std::ios::trunc);
+    if (f) f.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(data.size()));
+    if (f) showToast("State saved");
+    else showToast("Could not write the state file", Error);
+}
+
+void App::loadState() {
+    const std::string path = statePath();
+    std::ifstream f(path, std::ios::binary);
+    if (path.empty() || !f) {
+        showToast("No saved state for this game yet", Error);
+        return;
+    }
+    const std::vector<uint8_t> data((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    std::string error;
+    if (game_->loadState(data, error)) {
+        if (audio_) SDL_ClearAudioStream(audio_);
+        haltReported_ = false;
+        showToast("State loaded");
+    } else {
+        showToast("Cannot load state: " + error, Error);
+    }
+}
+
+void App::takeScreenshot() {
+    if (!game_ || !game_->bus().captureFrame(frame_)) {
+        showToast("Nothing to capture yet", Error);
+        return;
+    }
+    if (prefPath_.empty()) {
+        showToast("No place to save screenshots", Error);
+        return;
+    }
+    SDL_CreateDirectory((prefPath_ + "screenshots").c_str());
+
+    char stamp[32];
+    const std::time_t now = std::time(nullptr);
+    std::tm local{};
+#ifdef _WIN32
+    localtime_s(&local, &now);
+#else
+    localtime_r(&now, &local);
+#endif
+    std::strftime(stamp, sizeof stamp, "%Y%m%d_%H%M%S", &local);
+    const std::string name = game_->rom() ? safeFileName(game_->rom()->header().name) : "game";
+    const std::string path = prefPath_ + "screenshots/" + name + "_" + stamp + ".png";
+
+    SDL_Surface* surface = SDL_CreateSurfaceFrom(static_cast<int>(frame_.width), static_cast<int>(frame_.height),
+                                                 SDL_PIXELFORMAT_RGBA32, frame_.rgba.data(),
+                                                 static_cast<int>(frame_.width) * 4);
+    const bool saved = surface && SDL_SavePNG(surface, path.c_str());
+    if (surface) SDL_DestroySurface(surface);
+    showToast(saved ? "Screenshot saved" : "Could not save the screenshot", saved ? Good : Error);
 }
 
 // ---------------------------------------------------------------------------
@@ -357,34 +537,115 @@ void App::pollFileDialog() {
 }
 
 // ---------------------------------------------------------------------------
-// Input
+// Menus and input
 // ---------------------------------------------------------------------------
 
-void App::activateMenuItem(int index) {
-    switch (index) {
-        case 0: showFileDialog(); break;
-        case 1: screen_ = Screen::Controls; break;
-        case 2: running_ = false; break;
+void App::buildMenu() {
+    menu_.clear();
+    menu_.push_back({MenuEntry::Open, 0, "Open ROM..."});
+    for (size_t i = 0; i < settings_.recent.size() && i < MaxRecentShown; ++i) {
+        menu_.push_back({MenuEntry::Recent, static_cast<int>(i), truncate(baseName(settings_.recent[i]), 34)});
+    }
+    menu_.push_back({MenuEntry::Settings, 0, "Settings"});
+    menu_.push_back({MenuEntry::Controls, 0, "Controls"});
+    menu_.push_back({MenuEntry::Quit, 0, "Quit"});
+    selected_ = std::min(selected_, static_cast<int>(menu_.size()) - 1);
+}
+
+void App::activateMenuEntry(int index) {
+    if (index < 0 || index >= static_cast<int>(menu_.size())) return;
+    const MenuEntry& entry = menu_[static_cast<size_t>(index)];
+    switch (entry.kind) {
+        case MenuEntry::Open: showFileDialog(); break;
+        case MenuEntry::Recent: startGame(settings_.recent[static_cast<size_t>(entry.recentIndex)]); break;
+        case MenuEntry::Settings: screen_ = Screen::Settings; settingsSelected_ = 0; break;
+        case MenuEntry::Controls: screen_ = Screen::Controls; break;
+        case MenuEntry::Quit: running_ = false; break;
     }
 }
 
 void App::menuKey(SDL_Scancode scancode) {
+    const int count = static_cast<int>(menu_.size());
     switch (scancode) {
         case SDL_SCANCODE_UP:
         case SDL_SCANCODE_W:
-            selected_ = (selected_ + MenuItemCount - 1) % MenuItemCount;
+            selected_ = (selected_ + count - 1) % count;
             break;
         case SDL_SCANCODE_DOWN:
         case SDL_SCANCODE_S:
-            selected_ = (selected_ + 1) % MenuItemCount;
+            selected_ = (selected_ + 1) % count;
             break;
         case SDL_SCANCODE_RETURN:
         case SDL_SCANCODE_KP_ENTER:
         case SDL_SCANCODE_SPACE:
-            activateMenuItem(selected_);
+            activateMenuEntry(selected_);
             break;
         case SDL_SCANCODE_ESCAPE:
             running_ = false;
+            break;
+        default:
+            break;
+    }
+}
+
+// direction: +1 / -1 for Right / Left, 0 for Enter (toggle or advance).
+void App::adjustSetting(int row, int direction) {
+    switch (row) {
+        case RowForce60: settings_.force60 = !settings_.force60; break;
+        case RowCpu: {
+            int v = static_cast<int>(settings_.cyclesPerInstruction) + (direction == 0 ? 1 : direction);
+            if (v > static_cast<int>(Settings::MaxCyclesPerInstruction)) v = Settings::MinCyclesPerInstruction;
+            if (v < static_cast<int>(Settings::MinCyclesPerInstruction)) v = Settings::MaxCyclesPerInstruction;
+            settings_.cyclesPerInstruction = static_cast<unsigned>(v);
+            break;
+        }
+        case RowSmooth: settings_.smoothScaling = !settings_.smoothScaling; break;
+        case RowVolume: {
+            int v = settings_.volume + (direction == 0 ? 10 : direction * 10);
+            if (v > 100) v = 0;
+            if (v < 0) v = 100;
+            settings_.volume = v;
+            applyAudioVolume();
+            break;
+        }
+        case RowFullscreen:
+            settings_.fullscreen = !settings_.fullscreen;
+            fullscreen_ = settings_.fullscreen;
+            SDL_SetWindowFullscreen(window_, fullscreen_);
+            break;
+        case RowBack:
+            screen_ = Screen::Menu;
+            break;
+    }
+    saveSettings();
+}
+
+void App::settingsKey(SDL_Scancode scancode) {
+    switch (scancode) {
+        case SDL_SCANCODE_UP:
+        case SDL_SCANCODE_W:
+            settingsSelected_ = (settingsSelected_ + SettingsRowCount - 1) % SettingsRowCount;
+            break;
+        case SDL_SCANCODE_DOWN:
+        case SDL_SCANCODE_S:
+            settingsSelected_ = (settingsSelected_ + 1) % SettingsRowCount;
+            break;
+        case SDL_SCANCODE_LEFT:
+        case SDL_SCANCODE_A:
+            if (settingsSelected_ != RowBack) adjustSetting(settingsSelected_, -1);
+            break;
+        case SDL_SCANCODE_RIGHT:
+        case SDL_SCANCODE_D:
+            if (settingsSelected_ != RowBack) adjustSetting(settingsSelected_, +1);
+            break;
+        case SDL_SCANCODE_RETURN:
+        case SDL_SCANCODE_KP_ENTER:
+        case SDL_SCANCODE_SPACE:
+            adjustSetting(settingsSelected_, 0);
+            break;
+        case SDL_SCANCODE_ESCAPE:
+        case SDL_SCANCODE_BACKSPACE:
+            screen_ = Screen::Menu;
             break;
         default:
             break;
@@ -396,7 +657,9 @@ void App::handleKey(const SDL_KeyboardEvent& key) {
 
     if (key.down && key.scancode == SDL_SCANCODE_F11) {
         fullscreen_ = !fullscreen_;
+        settings_.fullscreen = fullscreen_;
         SDL_SetWindowFullscreen(window_, fullscreen_);
+        saveSettings();
         return;
     }
 
@@ -404,20 +667,29 @@ void App::handleKey(const SDL_KeyboardEvent& key) {
         case Screen::Menu:
             if (key.down && !menuInputBlocked()) menuKey(key.scancode);
             break;
+        case Screen::Settings:
+            if (key.down && !menuInputBlocked()) settingsKey(key.scancode);
+            break;
         case Screen::Controls:
             if (key.down && !menuInputBlocked() && (key.scancode == SDL_SCANCODE_ESCAPE || key.scancode == SDL_SCANCODE_RETURN ||
-                             key.scancode == SDL_SCANCODE_BACKSPACE)) {
+                                                    key.scancode == SDL_SCANCODE_BACKSPACE)) {
                 screen_ = Screen::Menu;
             }
             break;
         case Screen::Playing:
-            if (key.down && key.scancode == SDL_SCANCODE_ESCAPE) {
-                stopGame();
+            if (key.scancode == SDL_SCANCODE_TAB) {  // hold to fast-forward
+                fastForward_ = key.down;
                 return;
             }
-            if (key.down && key.scancode == SDL_SCANCODE_P) {
-                paused_ = !paused_;
-                return;
+            if (key.down) {
+                switch (key.scancode) {
+                    case SDL_SCANCODE_ESCAPE: stopGame(); return;
+                    case SDL_SCANCODE_P: paused_ = !paused_; return;
+                    case SDL_SCANCODE_F5: saveState(); return;
+                    case SDL_SCANCODE_F7: loadState(); return;
+                    case SDL_SCANCODE_F12: takeScreenshot(); return;
+                    default: break;
+                }
             }
             if (const char* name = SDL_GetScancodeName(key.scancode)) {
                 if (*name) input_.keyEvent(name, key.down);
@@ -432,17 +704,26 @@ void App::handleGamepadButton(const SDL_GamepadButtonEvent& button) {
     switch (button.button) {
         case SDL_GAMEPAD_BUTTON_DPAD_UP:
             if (screen_ == Screen::Menu) menuKey(SDL_SCANCODE_UP);
+            else if (screen_ == Screen::Settings) settingsKey(SDL_SCANCODE_UP);
             break;
         case SDL_GAMEPAD_BUTTON_DPAD_DOWN:
             if (screen_ == Screen::Menu) menuKey(SDL_SCANCODE_DOWN);
+            else if (screen_ == Screen::Settings) settingsKey(SDL_SCANCODE_DOWN);
+            break;
+        case SDL_GAMEPAD_BUTTON_DPAD_LEFT:
+            if (screen_ == Screen::Settings) settingsKey(SDL_SCANCODE_LEFT);
+            break;
+        case SDL_GAMEPAD_BUTTON_DPAD_RIGHT:
+            if (screen_ == Screen::Settings) settingsKey(SDL_SCANCODE_RIGHT);
             break;
         case SDL_GAMEPAD_BUTTON_SOUTH:
         case SDL_GAMEPAD_BUTTON_START:
-            if (screen_ == Screen::Menu) activateMenuItem(selected_);
+            if (screen_ == Screen::Menu) activateMenuEntry(selected_);
+            else if (screen_ == Screen::Settings) settingsKey(SDL_SCANCODE_RETURN);
             else screen_ = Screen::Menu;
             break;
         case SDL_GAMEPAD_BUTTON_EAST:
-            if (screen_ == Screen::Controls) screen_ = Screen::Menu;
+            if (screen_ != Screen::Menu) screen_ = Screen::Menu;
             break;
         default:
             break;
@@ -465,6 +746,7 @@ void App::pumpEvents() {
                 break;
             case SDL_EVENT_WINDOW_FOCUS_LOST:
                 input_.releaseAll();
+                fastForward_ = false;
                 break;
             case SDL_EVENT_WINDOW_FOCUS_GAINED:
                 blockMenuInput();
@@ -518,56 +800,101 @@ void App::centeredText(float y, float scale, Color color, const std::string& s) 
 void App::drawMessage(float y) {
     if (message_.empty()) return;
     const std::vector<std::string> lines = wrap(message_, 50);
-    for (size_t i = 0; i < lines.size() && i < 3; ++i) {
+    for (size_t i = 0; i < lines.size() && i < 2; ++i) {
         centeredText(y + static_cast<float>(i) * 16, 1.5f, messageIsError_ ? Error : Notice, lines[i]);
     }
 }
 
 void App::drawMenu() {
     if (iconTexture_) {
-        const SDL_FRect dst{(LogicalWidth - 210) / 2.0f, 14, 210, 210};
+        const SDL_FRect dst{(LogicalWidth - 150) / 2.0f, 8, 150, 150};
         SDL_RenderTexture(renderer_, iconTexture_, nullptr, &dst);
     } else {
-        centeredText(100, 5.0f, White, "Reality64");
+        centeredText(60, 4.0f, White, "Reality64");
     }
 
-    for (int i = 0; i < MenuItemCount; ++i) {
-        const bool sel = i == selected_;
-        const std::string label = std::string(sel ? "> " : "  ") + MenuItems[i] + (sel ? " <" : "  ");
-        centeredText(246.0f + 42.0f * static_cast<float>(i), 3.0f, sel ? Accent : White, label);
+    float y = 168;
+    for (size_t i = 0; i < menu_.size(); ++i) {
+        const MenuEntry& entry = menu_[i];
+        const bool sel = static_cast<int>(i) == selected_;
+        const bool recent = entry.kind == MenuEntry::Recent;
+        const float scale = recent ? 1.75f : 2.5f;
+        const std::string label = std::string(sel ? "> " : "  ") + entry.label + (sel ? " <" : "  ");
+        centeredText(y, scale, sel ? Accent : (recent ? Dim : White), label);
+        y += recent ? 22.0f : 32.0f;
     }
 
-    drawMessage(384);
-    centeredText(432, 1.5f, Dim, "Up/Down: select   Enter: confirm   Esc: quit");
-    centeredText(452, 1.5f, Dim, "Tip: drag a ROM file onto this window");
+    drawMessage(392);
+    centeredText(440, 1.5f, Dim, "Up/Down: select   Enter: confirm   Esc: quit");
+    centeredText(458, 1.5f, Dim, "Tip: drag a ROM file onto this window");
 
-    const std::string pads = "Gamepads: " + std::to_string(gamepads_.size());
-    text(8, 8, 1.5f, Dim, pads);
+    text(8, 8, 1.5f, Dim, "Gamepads: " + std::to_string(gamepads_.size()));
+}
+
+void App::drawSettings() {
+    centeredText(20, 3.0f, Accent, "Settings");
+
+    const auto onOff = [](bool v) { return v ? "ON" : "OFF"; };
+    const std::string values[SettingsRowCount] = {
+        onOff(settings_.force60),
+        std::to_string(settings_.cyclesPerInstruction) + " cycles/instr",
+        onOff(settings_.smoothScaling),
+        std::to_string(settings_.volume) + "%",
+        onOff(settings_.fullscreen),
+        "",
+    };
+    const char* names[SettingsRowCount] = {"Always 60 fps", "CPU speed", "Smooth scaling", "Volume", "Fullscreen", "Back"};
+    const char* help[SettingsRowCount] = {
+        "PAL games normally run at 50 Hz; ON shows them at 60 Hz (about 20% faster).",
+        "Higher = lighter on your PC. Lower = more demanding but more precise timing.",
+        "Smooths the picture when it is scaled up (OFF = sharp pixels).",
+        "Sound volume. Left/Right to change.",
+        "Also toggled with F11.",
+        "Return to the main menu.",
+    };
+
+    for (int i = 0; i < SettingsRowCount; ++i) {
+        const bool sel = i == settingsSelected_;
+        const float y = 90.0f + 44.0f * static_cast<float>(i);
+        std::string line = std::string(sel ? "> " : "  ") + names[i];
+        text(40, y, 2.0f, sel ? Accent : White, line);
+        if (i != RowBack) text(340, y, 2.0f, sel ? Accent : Dim, values[i]);
+    }
+
+    const std::vector<std::string> lines = wrap(help[settingsSelected_], 52);
+    for (size_t i = 0; i < lines.size() && i < 2; ++i) centeredText(372 + static_cast<float>(i) * 16, 1.5f, Notice, lines[i]);
+    centeredText(420, 1.5f, Dim, "Changes apply to the next game you start.");
+    centeredText(440, 1.5f, Dim, "Up/Down select   Left/Right change   Esc back");
 }
 
 void App::drawControls() {
-    centeredText(24, 3.0f, Accent, "Controls");
+    centeredText(16, 3.0f, Accent, "Controls");
 
     char line[96];
     const auto row = [&](float y, Color c, const char* a, const char* b, const char* d) {
         std::snprintf(line, sizeof line, "%-15s%-15s%s", a, b, d);
         text(40, y, 1.5f, c, line);
     };
-    row(90, Accent, "N64", "Keyboard", "Gamepad");
-    row(116, White, "Analog stick", "Arrow keys", "Left stick");
-    row(136, White, "A / B", "X / C", "A / X");
-    row(156, White, "Z", "Z", "Left trigger");
-    row(176, White, "L / R", "A / S", "Shoulders");
-    row(196, White, "Start", "Enter", "Start");
-    row(216, White, "D-pad", "T F G H", "D-pad");
-    row(236, White, "C buttons", "I J K L", "Right stick");
+    row(72, Accent, "N64", "Keyboard", "Gamepad");
+    row(98, White, "Analog stick", "Arrow keys", "Left stick");
+    row(118, White, "A / B", "X / C", "A / X");
+    row(138, White, "Z", "Z", "Left trigger");
+    row(158, White, "L / R", "A / S", "Shoulders");
+    row(178, White, "Start", "Enter", "Start");
+    row(198, White, "D-pad", "T F G H", "D-pad");
+    row(218, White, "C buttons", "I J K L", "Right stick");
 
-    text(40, 282, 1.5f, Dim, "In game:  Esc = menu   P = pause   F11 = fullscreen");
-    text(40, 308, 1.5f, Dim, "Any gamepad works and up to 4 can be used at once.");
-    text(40, 328, 1.5f, Dim, "To remap buttons, copy input.cfg.example to");
-    text(40, 348, 1.5f, Dim, "input.cfg next to the program and edit it.");
+    text(40, 258, 1.5f, Accent, "In game");
+    text(40, 280, 1.5f, White, "Esc  menu            P    pause");
+    text(40, 298, 1.5f, White, "F5   save state      F7   load state");
+    text(40, 316, 1.5f, White, "F12  screenshot      F11  fullscreen");
+    text(40, 334, 1.5f, White, "Tab  hold to fast-forward");
 
-    centeredText(440, 1.5f, Dim, "Esc / Enter: back");
+    text(40, 366, 1.5f, Dim, "Any gamepad works; up to 4 can be used at once.");
+    text(40, 384, 1.5f, Dim, "To remap, copy input.cfg.example to input.cfg");
+    text(40, 402, 1.5f, Dim, "next to the program and edit it.");
+
+    centeredText(444, 1.5f, Dim, "Esc / Enter: back");
 }
 
 void App::drawGame() {
@@ -576,11 +903,11 @@ void App::drawGame() {
         if (!texture_ || w != textureWidth_ || h != textureHeight_) {
             if (texture_) SDL_DestroyTexture(texture_);
             texture_ = SDL_CreateTexture(renderer_, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STREAMING, w, h);
-            if (texture_) SDL_SetTextureScaleMode(texture_, SDL_SCALEMODE_LINEAR);
             textureWidth_ = w;
             textureHeight_ = h;
         }
         if (texture_) {
+            SDL_SetTextureScaleMode(texture_, settings_.smoothScaling ? SDL_SCALEMODE_LINEAR : SDL_SCALEMODE_NEAREST);
             SDL_UpdateTexture(texture_, nullptr, frame_.rgba.data(), w * 4);
             SDL_RenderTexture(renderer_, texture_, nullptr, nullptr);
         }
@@ -595,7 +922,10 @@ void App::drawGame() {
         centeredText(456, 1.5f, Dim, "Esc: back to the menu");
     } else if (paused_) {
         centeredText(8, 2.0f, Accent, "PAUSED");
+    } else if (fastForward_) {
+        centeredText(8, 2.0f, Notice, ">> FAST FORWARD");
     }
+    if (SDL_GetTicks() < toastUntil_) centeredText(452, 1.75f, toastColor_, toast_);
 }
 
 void App::updateTitle(double fps) {
@@ -635,10 +965,15 @@ int App::run(const std::string& romPath) {
         SDL_RenderClear(renderer_);
 
         double refresh = 60.0;
+        int emulated = 0;
         if (screen_ == Screen::Playing && game_) {
             refresh = game_->bus().frameRate();
             if (!paused_ && !game_->cpu().halted()) {
-                game_->runFrame();
+                const int frames = fastForward_ ? FastForwardFrames : 1;
+                for (int i = 0; i < frames && !game_->cpu().halted(); ++i) {
+                    game_->runFrame();
+                    ++emulated;
+                }
             } else if (game_->cpu().halted() && !haltReported_) {
                 haltReported_ = true;
                 std::fprintf(stderr, "CPU stopped: %s\n", game_->cpu().haltReason().c_str());
@@ -646,12 +981,14 @@ int App::run(const std::string& romPath) {
             drawGame();
         } else if (screen_ == Screen::Controls) {
             drawControls();
+        } else if (screen_ == Screen::Settings) {
+            drawSettings();
         } else {
             drawMenu();
         }
         SDL_RenderPresent(renderer_);
 
-        ++framesSinceTitle;
+        framesSinceTitle += emulated > 0 ? emulated : 1;
         const Uint64 now = SDL_GetTicksNS();
         if (now - fpsStart >= 1000000000ull) {
             updateTitle(framesSinceTitle * 1e9 / static_cast<double>(now - fpsStart));
@@ -659,14 +996,19 @@ int App::run(const std::string& romPath) {
             fpsStart = now;
         }
 
-        // The menus are always paced; a game can opt out with --no-limit.
-        if (options_.frameLimit || screen_ != Screen::Playing) {
-            nextFrame += static_cast<Uint64>(1e9 / refresh);
+        // Menus are always paced; a game can opt out with --no-limit or fast-forward.
+        const bool pace = (options_.frameLimit && !fastForward_) || screen_ != Screen::Playing;
+        if (pace) {
+            const Uint64 frameNs = static_cast<Uint64>(1e9 / refresh);
+            nextFrame += frameNs;
             const Uint64 after = SDL_GetTicksNS();
-            if (nextFrame > after) SDL_DelayNS(nextFrame - after);
-            else if (after - nextFrame > 5 * static_cast<Uint64>(1e9 / refresh)) nextFrame = after;
+            if (nextFrame > after) SDL_DelayPrecise(nextFrame - after);
+            else if (after - nextFrame > 5 * frameNs) nextFrame = after;  // fell behind: don't try to catch up
+        } else {
+            nextFrame = SDL_GetTicksNS();
         }
     }
+    saveSettings();
     return 0;
 }
 

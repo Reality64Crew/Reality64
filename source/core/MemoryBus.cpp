@@ -72,8 +72,8 @@ void MemoryBus::applyBootRegisterState() {
     ri_[4] = 0x00063634;  // RI_REFRESH
 }
 
-void MemoryBus::setVideoStandard(bool pal) {
-    frameCycles_ = CpuClockHz / (pal ? 50 : 60);
+void MemoryBus::setVideoStandard(bool pal, unsigned refreshHz) {
+    frameCycles_ = CpuClockHz / (refreshHz ? refreshHz : (pal ? 50 : 60));
     defaultLines_ = pal ? 625 : 525;
 }
 
@@ -549,6 +549,68 @@ void MemoryBus::advance(uint64_t cycles) {
             if (aiCount_ > 0) startAudioBuffer(finishedAt);
         }
     }
+}
+
+void MemoryBus::saveState(StateWriter& w) const {
+    w.bytes(rdram_.data(), rdram_.size());
+    w.bytes(spMem_.data(), spMem_.size());
+    w.bytes(pifRam_.data(), pifRam_.size());
+    w.u32(spMemAddr_); w.u32(spDramAddr_); w.u32(spStatus_); w.u32(spSemaphore_); w.u32(spPc_);
+    w.u32s(dpc_);
+    w.u32s(dps_);
+    w.u32(miMode_); w.u32(miIntr_); w.u32(miMask_);
+    w.u32s(vi_);
+    w.u32(aiDramAddr_); w.u32(aiControl_); w.u32(aiDacRate_); w.u32(aiBitRate_);
+    for (const AudioBuffer& b : aiQueue_) { w.u32(b.address); w.u32(b.length); }
+    w.u32(aiCount_);
+    w.u64(aiEndCycle_);
+    w.u32(piDramAddr_); w.u32(piCartAddr_);
+    w.u32s(piDomain_);
+    w.boolean(piBusy_);
+    w.u64(piDoneCycle_);
+    w.u32s(ri_);
+    w.u32(siDramAddr_);
+    w.boolean(siBusy_);
+    w.u64(siDoneCycle_);
+    w.u64(cycles_);
+    w.u64(frameCycles_);
+    w.u32(defaultLines_);
+    w.u32(viLine_);
+    w.u64(viLineProgress_);
+    w.u64(frameCount_);
+    w.u64(unmappedAccesses_);
+    w.u64(rspStartRequests_);
+}
+
+void MemoryBus::loadState(StateReader& r) {
+    r.bytes(rdram_.data(), rdram_.size());
+    r.bytes(spMem_.data(), spMem_.size());
+    r.bytes(pifRam_.data(), pifRam_.size());
+    spMemAddr_ = r.u32(); spDramAddr_ = r.u32(); spStatus_ = r.u32(); spSemaphore_ = r.u32(); spPc_ = r.u32();
+    r.u32s(dpc_);
+    r.u32s(dps_);
+    miMode_ = r.u32(); miIntr_ = r.u32(); miMask_ = r.u32();
+    r.u32s(vi_);
+    aiDramAddr_ = r.u32(); aiControl_ = r.u32(); aiDacRate_ = r.u32(); aiBitRate_ = r.u32();
+    for (AudioBuffer& b : aiQueue_) { b.address = r.u32(); b.length = r.u32(); }
+    aiCount_ = std::min<uint32_t>(r.u32(), static_cast<uint32_t>(aiQueue_.size()));
+    aiEndCycle_ = r.u64();
+    piDramAddr_ = r.u32(); piCartAddr_ = r.u32();
+    r.u32s(piDomain_);
+    piBusy_ = r.boolean();
+    piDoneCycle_ = r.u64();
+    r.u32s(ri_);
+    siDramAddr_ = r.u32();
+    siBusy_ = r.boolean();
+    siDoneCycle_ = r.u64();
+    cycles_ = r.u64();
+    frameCycles_ = std::max<uint64_t>(1, r.u64());
+    defaultLines_ = r.u32();
+    viLine_ = r.u32();
+    viLineProgress_ = r.u64();
+    frameCount_ = r.u64();
+    unmappedAccesses_ = r.u64();
+    rspStartRequests_ = r.u64();
 }
 
 }  // namespace reality64

@@ -27,6 +27,7 @@ add_library(reality64_core STATIC
     source/core/MemoryBus.cpp
     source/core/Pif.cpp
     source/core/Rom.cpp
+    source/core/Settings.cpp
     source/core/Video.cpp
     source/cpu/VR4300.cpp
     source/cpu/VR4300Fpu.cpp

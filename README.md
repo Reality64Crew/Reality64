@@ -20,7 +20,9 @@ show output.
 | Input: keyboard + any gamepad, hot-plug, configurable bindings | done |
 | Boot: high-level (PIF/IPL3 skipped), region (NTSC/PAL) from the game code | done; CIC table not yet checked against real dumps |
 | RSP (microcode), RDP (rasteriser) | **missing** - starting the RSP completes a null task at once so games don't deadlock |
-| Save data (EEPROM / SRAM / Flash), Controller Pak, rumble | missing |
+| Save states (one slot per game), screenshots, fast-forward | done |
+| Settings (always-60-fps, CPU speed model, scaling, volume) and a recent-games list | done |
+| Cartridge save data (EEPROM / SRAM / Flash), Controller Pak, rumble | missing |
 
 The window frontend (SDL3) is built on Windows, Linux and macOS. The Android and
 iOS builds are headless (core + command line): SDL needs an app wrapper on those
@@ -60,10 +62,30 @@ Reality64 --info game.z64               # print the ROM header
 Reality64 --headless --frames 60 --screenshot out.ppm game.z64
 Reality64 --headless --steps 100000 game.z64   # run N instructions, dump registers
 Reality64 --trace game.z64              # print every executed instruction
+Reality64 --cpi 3 --force60 off game.z64   # CPU speed model, real PAL refresh rate
 ```
 
-Window keys: `Esc` back to the menu (and quit from the menu), `P` pause, `F11` fullscreen.
-If the emulated CPU hits something unsupported, the reason is shown on screen.
+In a game: `Esc` back to the menu (and quit from the menu), `P` pause, `F5` save state, `F7` load
+state, `F12` screenshot, `F11` fullscreen, hold `Tab` to fast-forward. If the emulated CPU hits
+something unsupported, the reason is shown on screen.
+
+Settings, save states and screenshots live in your user data folder (`%APPDATA%\Reality64Crew\Reality64`
+on Windows). Save states only load into the same game they were made from.
+
+## Speed and 60 fps
+
+The emulator is built to hold 60 fps. The interpreter is tuned for the host (compare-chain
+instruction dispatch, byte-swapped loads, per-batch timers) and time is modelled as a number of
+**cycles per instruction** (default 2, adjustable in Settings or with `--cpi`). The real VR4300
+averages well over one cycle per instruction once cache misses and RDRAM latency count, so this
+is closer to the hardware than 1, and it halves the host speed needed. The pacing is exact
+(precise sleeps), and **Always 60 fps** (on by default) shows PAL games at 60 Hz instead of 50 Hz,
+which makes them run about 20% faster than on a real console.
+
+On the development PC a trivial program runs at ~180 fps unthrottled, and the 60 fps lock holds
+with a wide margin. Real games execute more per frame and do work the emulator does not yet
+(RSP/RDP), so how fast they run depends on your CPU. If a game cannot keep up, raise the CPU
+speed model in Settings. Hold `Tab` to fast-forward.
 
 ## Controls
 

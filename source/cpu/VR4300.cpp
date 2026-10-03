@@ -71,7 +71,7 @@ void VR4300::halt(const std::string& reason) {
 // One instruction with full per-instruction bookkeeping.
 bool VR4300::step() {
     if (halted_) return false;
-    if (serviceTimersAndInterrupts(1)) {
+    if (serviceTimersAndInterrupts(cyclesPerInstruction_)) {
         ++instructionCount_;  // the interrupt entry itself
         return true;
     }
@@ -87,7 +87,7 @@ uint64_t VR4300::run(uint64_t maxInstructions) {
     uint64_t done = 0;
     while (done < maxInstructions && !halted_) {
         const uint64_t n = std::min(maxInstructions - done, Batch);
-        serviceTimersAndInterrupts(n);  // if one is taken, the batch continues in the handler
+        serviceTimersAndInterrupts(n * cyclesPerInstruction_);  // if one is taken, the batch continues in the handler
         for (uint64_t i = 0; i < n; ++i) {
             executeOne();
             if (halted_) return done + i;
@@ -97,11 +97,11 @@ uint64_t VR4300::run(uint64_t maxInstructions) {
     return done;
 }
 
-// Advances Count/Compare by `instructions` and takes a pending interrupt.
+// Advances Count/Compare by `cycles` clock cycles and takes a pending interrupt.
 // Returns true if an interrupt was taken.
-bool VR4300::serviceTimersAndInterrupts(uint64_t instructions) {
+bool VR4300::serviceTimersAndInterrupts(uint64_t cycles) {
     // Count advances at half the pipeline clock; keep the odd half-tick between calls.
-    const uint64_t halfTicks = (countHalfTick_ ? 1u : 0u) + instructions;
+    const uint64_t halfTicks = (countHalfTick_ ? 1u : 0u) + cycles;
     countHalfTick_ = (halfTicks & 1) != 0;
     const uint32_t increment = static_cast<uint32_t>(halfTicks / 2);
     if (increment) {
@@ -173,7 +173,7 @@ bool VR4300::translate(uint64_t vaddr, Access access, uint32_t& paddr) {
     return translateTlb(vaddr, access, paddr);
 }
 
-bool VR4300::readMem(uint64_t vaddr, unsigned size, uint64_t& value) {
+bool VR4300::readMemSlow(uint64_t vaddr, unsigned size, uint64_t& value) {
     if (vaddr & (size - 1)) {
         cop0_[BadVAddr] = vaddr;
         raiseException(ExcAddressErrorLoad);
@@ -185,7 +185,7 @@ bool VR4300::readMem(uint64_t vaddr, unsigned size, uint64_t& value) {
     return true;
 }
 
-bool VR4300::writeMem(uint64_t vaddr, unsigned size, uint64_t value) {
+bool VR4300::writeMemSlow(uint64_t vaddr, unsigned size, uint64_t value) {
     if (vaddr & (size - 1)) {
         cop0_[BadVAddr] = vaddr;
         raiseException(ExcAddressErrorStore);
@@ -297,34 +297,131 @@ void VR4300::writeCop0(unsigned reg, uint64_t value) {
     }
 }
 
+// The hot path. The opcodes that make up nearly all executed code are decoded
+// here with a chain of compares ordered by how common they are, rather than a
+// jump table: well-predicted conditional branches beat the indirect jump of a
+// switch by a wide margin on current CPUs (which pay dearly for mispredicted or
+// mitigated indirect branches). Everything rare goes through executeSpecial()
+// and executeSlow().
 void VR4300::execute(uint32_t instr) {
     const uint32_t op = instr >> 26;
     const unsigned rs = (instr >> 21) & 31;
     const unsigned rt = (instr >> 16) & 31;
     const uint64_t simm = sx16(instr & 0xFFFF);
-    const uint64_t uimm = instr & 0xFFFF;
+
+    if (op == 0x23) {  // LW
+        uint64_t v;
+        if (readMem(gpr_[rs] + simm, 4, v)) gpr_[rt] = sx32(static_cast<uint32_t>(v));
+        return;
+    }
+    if (op == 0x09) {  // ADDIU
+        gpr_[rt] = sx32(static_cast<uint32_t>(gpr_[rs] + simm));
+        return;
+    }
+    if (op == 0x2B) {  // SW
+        writeMem(gpr_[rs] + simm, 4, gpr_[rt]);
+        return;
+    }
+    if (op == 0x00) {  // SPECIAL
+        const unsigned fn = instr & 0x3F;
+        const unsigned rd = (instr >> 11) & 31;
+        const unsigned sa = (instr >> 6) & 31;
+        const uint64_t a = gpr_[rs];
+        const uint64_t b = gpr_[rt];
+        if (fn == 0x00) { gpr_[rd] = sx32(static_cast<uint32_t>(b) << sa); return; }   // SLL
+        if (fn == 0x21) { gpr_[rd] = sx32(static_cast<uint32_t>(a + b)); return; }     // ADDU
+        if (fn == 0x25) { gpr_[rd] = a | b; return; }                                  // OR
+        if (fn == 0x08) { branch(true, a, false); return; }                            // JR
+        if (fn == 0x24) { gpr_[rd] = a & b; return; }                                  // AND
+        if (fn == 0x02) { gpr_[rd] = sx32(static_cast<uint32_t>(b) >> sa); return; }   // SRL
+        if (fn == 0x2B) { gpr_[rd] = a < b; return; }                                  // SLTU
+        if (fn == 0x2A) { gpr_[rd] = static_cast<int64_t>(a) < static_cast<int64_t>(b); return; }  // SLT
+        if (fn == 0x23) { gpr_[rd] = sx32(static_cast<uint32_t>(a - b)); return; }     // SUBU
+        if (fn == 0x03) {                                                              // SRA
+            gpr_[rd] = sx32(static_cast<uint32_t>(static_cast<int32_t>(static_cast<uint32_t>(b)) >> sa));
+            return;
+        }
+        if (fn == 0x26) { gpr_[rd] = a ^ b; return; }                                  // XOR
+        if (fn == 0x27) { gpr_[rd] = ~(a | b); return; }                               // NOR
+        if (fn == 0x2D) { gpr_[rd] = a + b; return; }                                  // DADDU
+        executeSpecial(instr);
+        return;
+    }
+    if (op == 0x0F) { gpr_[rt] = sx32((instr & 0xFFFF) << 16); return; }  // LUI
+    if (op == 0x0D) { gpr_[rt] = gpr_[rs] | (instr & 0xFFFF); return; }   // ORI
+    if (op == 0x05) { branch(gpr_[rs] != gpr_[rt], pc_ + (simm << 2), false); return; }  // BNE
+    if (op == 0x04) { branch(gpr_[rs] == gpr_[rt], pc_ + (simm << 2), false); return; }  // BEQ
+    if (op == 0x24) {  // LBU
+        uint64_t v;
+        if (readMem(gpr_[rs] + simm, 1, v)) gpr_[rt] = v;
+        return;
+    }
+    if (op == 0x28) { writeMem(gpr_[rs] + simm, 1, gpr_[rt]); return; }  // SB
+    if (op == 0x0C) { gpr_[rt] = gpr_[rs] & (instr & 0xFFFF); return; }  // ANDI
+    if (op == 0x11) { executeCop1(instr); return; }
+    if (op == 0x02) {  // J
+        branch(true, (pc_ & 0xFFFFFFFFF0000000ull) | ((instr & 0x03FFFFFFu) << 2), false);
+        return;
+    }
+    if (op == 0x03) {  // JAL
+        gpr_[31] = pc_ + 4;
+        branch(true, (pc_ & 0xFFFFFFFFF0000000ull) | ((instr & 0x03FFFFFFu) << 2), false);
+        return;
+    }
+    if (op == 0x21) {  // LH
+        uint64_t v;
+        if (readMem(gpr_[rs] + simm, 2, v)) gpr_[rt] = sx16(static_cast<uint32_t>(v));
+        return;
+    }
+    if (op == 0x25) {  // LHU
+        uint64_t v;
+        if (readMem(gpr_[rs] + simm, 2, v)) gpr_[rt] = v;
+        return;
+    }
+    if (op == 0x20) {  // LB
+        uint64_t v;
+        if (readMem(gpr_[rs] + simm, 1, v)) gpr_[rt] = static_cast<uint64_t>(static_cast<int64_t>(static_cast<int8_t>(v)));
+        return;
+    }
+    if (op == 0x29) { writeMem(gpr_[rs] + simm, 2, gpr_[rt]); return; }  // SH
+    if (op == 0x0A) { gpr_[rt] = static_cast<int64_t>(gpr_[rs]) < static_cast<int64_t>(simm); return; }  // SLTI
+    if (op == 0x0B) { gpr_[rt] = gpr_[rs] < simm; return; }               // SLTIU
+    if (op == 0x15) { branch(gpr_[rs] != gpr_[rt], pc_ + (simm << 2), true); return; }   // BNEL
+    if (op == 0x14) { branch(gpr_[rs] == gpr_[rt], pc_ + (simm << 2), true); return; }   // BEQL
+    if (op == 0x06) { branch(static_cast<int64_t>(gpr_[rs]) <= 0, pc_ + (simm << 2), false); return; }  // BLEZ
+    if (op == 0x07) { branch(static_cast<int64_t>(gpr_[rs]) > 0, pc_ + (simm << 2), false); return; }   // BGTZ
+    if (op == 0x0E) { gpr_[rt] = gpr_[rs] ^ (instr & 0xFFFF); return; }   // XORI
+    if (op == 0x31 || op == 0x39) {  // LWC1, SWC1
+        executeFpuMemory(instr, gpr_[rs] + simm);
+        return;
+    }
+    if (op == 0x19) { gpr_[rt] = gpr_[rs] + simm; return; }               // DADDIU
+    if (op == 0x37) {  // LD
+        uint64_t v;
+        if (readMem(gpr_[rs] + simm, 8, v)) gpr_[rt] = v;
+        return;
+    }
+    if (op == 0x3F) { writeMem(gpr_[rs] + simm, 8, gpr_[rt]); return; }   // SD
+    if (op == 0x27) {  // LWU
+        uint64_t v;
+        if (readMem(gpr_[rs] + simm, 4, v)) gpr_[rt] = v;
+        return;
+    }
+    if (op == 0x16) { branch(static_cast<int64_t>(gpr_[rs]) <= 0, pc_ + (simm << 2), true); return; }   // BLEZL
+    if (op == 0x17) { branch(static_cast<int64_t>(gpr_[rs]) > 0, pc_ + (simm << 2), true); return; }    // BGTZL
+    executeSlow(instr);
+}
+
+// Everything the hot path in execute() does not decode.
+void VR4300::executeSlow(uint32_t instr) {
+    const uint32_t op = instr >> 26;
+    const unsigned rs = (instr >> 21) & 31;
+    const unsigned rt = (instr >> 16) & 31;
+    const uint64_t simm = sx16(instr & 0xFFFF);
     const uint64_t addr = gpr_[rs] + simm;
 
     switch (op) {
-        case 0x00: executeSpecial(instr); break;
         case 0x01: executeRegimm(instr); break;
-
-        case 0x02:  // J
-        case 0x03: {  // JAL
-            const uint64_t target = (pc_ & 0xFFFFFFFFF0000000ull) | ((instr & 0x03FFFFFFu) << 2);
-            if (op == 0x03) gpr_[31] = pc_ + 4;
-            branch(true, target, false);
-            break;
-        }
-
-        case 0x04: branch(gpr_[rs] == gpr_[rt], pc_ + (simm << 2), false); break;   // BEQ
-        case 0x05: branch(gpr_[rs] != gpr_[rt], pc_ + (simm << 2), false); break;   // BNE
-        case 0x06: branch(static_cast<int64_t>(gpr_[rs]) <= 0, pc_ + (simm << 2), false); break;  // BLEZ
-        case 0x07: branch(static_cast<int64_t>(gpr_[rs]) > 0, pc_ + (simm << 2), false); break;   // BGTZ
-        case 0x14: branch(gpr_[rs] == gpr_[rt], pc_ + (simm << 2), true); break;    // BEQL
-        case 0x15: branch(gpr_[rs] != gpr_[rt], pc_ + (simm << 2), true); break;    // BNEL
-        case 0x16: branch(static_cast<int64_t>(gpr_[rs]) <= 0, pc_ + (simm << 2), true); break;   // BLEZL
-        case 0x17: branch(static_cast<int64_t>(gpr_[rs]) > 0, pc_ + (simm << 2), true); break;    // BGTZL
 
         case 0x08: {  // ADDI
             const uint32_t a = static_cast<uint32_t>(gpr_[rs]);
@@ -334,14 +431,6 @@ void VR4300::execute(uint32_t instr) {
             else gpr_[rt] = sx32(r);
             break;
         }
-        case 0x09: gpr_[rt] = sx32(static_cast<uint32_t>(gpr_[rs] + simm)); break;  // ADDIU
-        case 0x0A: gpr_[rt] = static_cast<int64_t>(gpr_[rs]) < static_cast<int64_t>(simm); break;  // SLTI
-        case 0x0B: gpr_[rt] = gpr_[rs] < simm; break;  // SLTIU
-        case 0x0C: gpr_[rt] = gpr_[rs] & uimm; break;  // ANDI
-        case 0x0D: gpr_[rt] = gpr_[rs] | uimm; break;  // ORI
-        case 0x0E: gpr_[rt] = gpr_[rs] ^ uimm; break;  // XORI
-        case 0x0F: gpr_[rt] = sx32(static_cast<uint32_t>(uimm << 16)); break;  // LUI
-
         case 0x10: executeCop0(instr); break;
         case 0x11: executeCop1(instr); break;
         case 0x31:  // LWC1
@@ -355,43 +444,6 @@ void VR4300::execute(uint32_t instr) {
             const uint64_t r = gpr_[rs] + simm;
             if (addOverflow64(gpr_[rs], simm, r)) raiseException(ExcOverflow);
             else gpr_[rt] = r;
-            break;
-        }
-        case 0x19: gpr_[rt] = gpr_[rs] + simm; break;  // DADDIU
-
-        case 0x20: {  // LB
-            uint64_t v;
-            if (readMem(addr, 1, v)) gpr_[rt] = static_cast<uint64_t>(static_cast<int64_t>(static_cast<int8_t>(v)));
-            break;
-        }
-        case 0x21: {  // LH
-            uint64_t v;
-            if (readMem(addr, 2, v)) gpr_[rt] = sx16(static_cast<uint32_t>(v));
-            break;
-        }
-        case 0x23: {  // LW
-            uint64_t v;
-            if (readMem(addr, 4, v)) gpr_[rt] = sx32(static_cast<uint32_t>(v));
-            break;
-        }
-        case 0x24: {  // LBU
-            uint64_t v;
-            if (readMem(addr, 1, v)) gpr_[rt] = v;
-            break;
-        }
-        case 0x25: {  // LHU
-            uint64_t v;
-            if (readMem(addr, 2, v)) gpr_[rt] = v;
-            break;
-        }
-        case 0x27: {  // LWU
-            uint64_t v;
-            if (readMem(addr, 4, v)) gpr_[rt] = v;
-            break;
-        }
-        case 0x37: {  // LD
-            uint64_t v;
-            if (readMem(addr, 8, v)) gpr_[rt] = v;
             break;
         }
         case 0x30: {  // LL
@@ -448,10 +500,6 @@ void VR4300::execute(uint32_t instr) {
             break;
         }
 
-        case 0x28: writeMem(addr, 1, gpr_[rt]); break;  // SB
-        case 0x29: writeMem(addr, 2, gpr_[rt]); break;  // SH
-        case 0x2B: writeMem(addr, 4, gpr_[rt]); break;  // SW
-        case 0x3F: writeMem(addr, 8, gpr_[rt]); break;  // SD
         case 0x38:  // SC
             if (llBit_) {
                 if (writeMem(addr, 4, gpr_[rt])) gpr_[rt] = 1;
@@ -520,14 +568,12 @@ void VR4300::executeSpecial(uint32_t instr) {
     const uint32_t b32 = static_cast<uint32_t>(b);
 
     switch (instr & 0x3F) {
-        case 0x00: gpr_[rd] = sx32(b32 << sa); break;  // SLL
-        case 0x02: gpr_[rd] = sx32(b32 >> sa); break;  // SRL
-        case 0x03: gpr_[rd] = sx32(static_cast<uint32_t>(static_cast<int32_t>(b32) >> sa)); break;  // SRA
+        // SLL/SRL/SRA, JR, ADDU/SUBU, the logic ops, SLT/SLTU and DADDU are on
+        // the hot path in execute().
         case 0x04: gpr_[rd] = sx32(b32 << (a32 & 31)); break;  // SLLV
         case 0x06: gpr_[rd] = sx32(b32 >> (a32 & 31)); break;  // SRLV
         case 0x07: gpr_[rd] = sx32(static_cast<uint32_t>(static_cast<int32_t>(b32) >> (a32 & 31))); break;  // SRAV
 
-        case 0x08: branch(true, a, false); break;  // JR
         case 0x09: {  // JALR
             const uint64_t target = a;
             gpr_[rd] = pc_ + 4;
@@ -616,27 +662,18 @@ void VR4300::executeSpecial(uint32_t instr) {
             else gpr_[rd] = sx32(r);
             break;
         }
-        case 0x21: gpr_[rd] = sx32(a32 + b32); break;  // ADDU
         case 0x22: {  // SUB
             const uint32_t r = a32 - b32;
             if (subOverflow32(a32, b32, r)) raiseException(ExcOverflow);
             else gpr_[rd] = sx32(r);
             break;
         }
-        case 0x23: gpr_[rd] = sx32(a32 - b32); break;  // SUBU
-        case 0x24: gpr_[rd] = a & b; break;            // AND
-        case 0x25: gpr_[rd] = a | b; break;            // OR
-        case 0x26: gpr_[rd] = a ^ b; break;            // XOR
-        case 0x27: gpr_[rd] = ~(a | b); break;         // NOR
-        case 0x2A: gpr_[rd] = static_cast<int64_t>(a) < static_cast<int64_t>(b); break;  // SLT
-        case 0x2B: gpr_[rd] = a < b; break;            // SLTU
         case 0x2C: {  // DADD
             const uint64_t r = a + b;
             if (addOverflow64(a, b, r)) raiseException(ExcOverflow);
             else gpr_[rd] = r;
             break;
         }
-        case 0x2D: gpr_[rd] = a + b; break;  // DADDU
         case 0x2E: {  // DSUB
             const uint64_t r = a - b;
             if (subOverflow64(a, b, r)) raiseException(ExcOverflow);
@@ -740,6 +777,61 @@ void VR4300::executeCop0(uint32_t instr) {
             }
             break;
     }
+}
+
+void VR4300::saveState(StateWriter& w) const {
+    w.u64s(gpr_);
+    w.u64s(cop0_);
+    w.u64s(fpr_);
+    for (const TlbEntry& e : tlb_) {
+        w.u32(e.mask);
+        w.u32(e.hi);
+        w.u32(e.lo0);
+        w.u32(e.lo1);
+        w.boolean(e.global);
+    }
+    w.u32(fcsr_);
+    w.u64(hi_);
+    w.u64(lo_);
+    w.u64(pc_);
+    w.u64(nextPc_);
+    w.u64(currentPc_);
+    w.boolean(nextIsDelaySlot_);
+    w.boolean(inDelaySlot_);
+    w.boolean(llBit_);
+    w.boolean(countHalfTick_);
+    w.boolean(halted_);
+    w.string(haltReason_);
+    w.u64(instructionCount_);
+    w.u32(cyclesPerInstruction_);
+}
+
+void VR4300::loadState(StateReader& r) {
+    r.u64s(gpr_);
+    r.u64s(cop0_);
+    r.u64s(fpr_);
+    for (TlbEntry& e : tlb_) {
+        e.mask = r.u32();
+        e.hi = r.u32();
+        e.lo0 = r.u32();
+        e.lo1 = r.u32();
+        e.global = r.boolean();
+    }
+    fcsr_ = r.u32();
+    hi_ = r.u64();
+    lo_ = r.u64();
+    pc_ = r.u64();
+    nextPc_ = r.u64();
+    currentPc_ = r.u64();
+    nextIsDelaySlot_ = r.boolean();
+    inDelaySlot_ = r.boolean();
+    llBit_ = r.boolean();
+    countHalfTick_ = r.boolean();
+    halted_ = r.boolean();
+    haltReason_ = r.string();
+    instructionCount_ = r.u64();
+    const uint32_t cpi = r.u32();
+    cyclesPerInstruction_ = cpi ? cpi : 1;
 }
 
 }  // namespace reality64

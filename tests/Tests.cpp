@@ -12,6 +12,7 @@
 #include "core/Emulator.h"
 #include "core/MemoryBus.h"
 #include "core/Rom.h"
+#include "core/Settings.h"
 #include "cpu/VR4300.h"
 #include "input/InputMapper.h"
 
@@ -870,7 +871,8 @@ void testRegionAndFrameLoop() {
 
     const uint64_t steps = emu.runFrame();
     CHECK_EQ(emu.bus().frameCount(), 1);
-    CHECK_EQ(steps > 1800000 && steps < 1900000, true);  // ~93.75M / 50 cycles
+    const uint64_t cycles = steps * emu.cyclesPerInstruction();
+    CHECK_EQ(cycles > 1800000 && cycles < 1900000, true);  // ~93.75M / 50 cycles
     CHECK_EQ(emu.cpu().halted(), false);
 
     std::error_code ec;
@@ -986,6 +988,180 @@ void testEmulatorBoot() {
     CHECK_EQ(missing.loadRom((path.parent_path() / "does_not_exist.z64").string(), error), false);
 }
 
+// --- Settings and save states ---------------------------------------------------
+
+void testSettingsRoundTrip() {
+    Settings a;
+    a.force60 = false;
+    a.cyclesPerInstruction = 3;
+    a.smoothScaling = false;
+    a.volume = 40;
+    a.fullscreen = true;
+    a.addRecent("C:\\roms\\one.z64");
+    a.addRecent("/home/me/two # with hash.z64");
+    a.addRecent("C:\\roms\\one.z64");  // moves to the front instead of duplicating
+
+    CHECK_EQ(a.recent.size(), 2);
+    CHECK_EQ(a.recent[0] == "C:\\roms\\one.z64", true);
+
+    Settings b;
+    std::vector<std::string> errors;
+    CHECK_EQ(b.parse(a.serialize(), errors), true);
+    CHECK_EQ(errors.size(), 0);
+    CHECK_EQ(b.force60, false);
+    CHECK_EQ(b.cyclesPerInstruction, 3);
+    CHECK_EQ(b.smoothScaling, false);
+    CHECK_EQ(b.volume, 40);
+    CHECK_EQ(b.fullscreen, true);
+    CHECK_EQ(b.recent == a.recent, true);
+
+    Settings defaults;  // "always 60 fps" is the default
+    CHECK_EQ(defaults.force60, true);
+}
+
+void testSettingsRecentListIsCappedAndBadLinesReported() {
+    Settings s;
+    for (int i = 0; i < 10; ++i) s.addRecent("rom" + std::to_string(i) + ".z64");
+    CHECK_EQ(s.recent.size(), Settings::MaxRecent);
+    CHECK_EQ(s.recent[0] == "rom9.z64", true);
+    s.removeRecent("rom9.z64");
+    CHECK_EQ(s.recent[0] == "rom8.z64", true);
+
+    Settings t;
+    std::vector<std::string> errors;
+    const bool ok = t.parse(
+        "volume = 500\n"
+        "cyclesPerInstruction = 0\n"
+        "force60 = maybe\n"
+        "colour = blue\n"
+        "just text\n"
+        "volume = 25\n",  // still applied
+        errors);
+    CHECK_EQ(ok, false);
+    CHECK_EQ(errors.size(), 5);
+    CHECK_EQ(t.volume, 25);
+    CHECK_EQ(t.cyclesPerInstruction, 2);  // unchanged
+}
+
+std::filesystem::path writeRomToTemp(const std::vector<uint8_t>& rom, const char* name) {
+    const std::filesystem::path path = std::filesystem::temp_directory_path() / name;
+    std::ofstream f(path, std::ios::binary);
+    f.write(reinterpret_cast<const char*>(rom.data()), static_cast<std::streamsize>(rom.size()));
+    return path;
+}
+
+void putWord(std::vector<uint8_t>& rom, size_t offset, uint32_t word) {
+    for (int b = 0; b < 4; ++b) rom[offset + b] = static_cast<uint8_t>(word >> (24 - 8 * b));
+}
+
+// A ROM whose game counts forever and mirrors the counter into RDRAM.
+std::vector<uint8_t> makeCounterRom(const char* title) {
+    std::vector<uint8_t> rom = makeRomZ64(0x80001000);
+    for (size_t i = 0; i < 20; ++i) rom[0x20 + i] = i < std::strlen(title) ? static_cast<uint8_t>(title[i]) : ' ';
+    const uint32_t code[] = {
+        lui(t1, 0x8000), ori(t1, t1, 0x2000),
+        addiu(t0, t0, 1),        // loop:
+        sw(t0, 0, t1),
+        beq(zero, zero, -3),
+        NOP,
+    };
+    for (size_t i = 0; i < 6; ++i) putWord(rom, 0x1000 + i * 4, code[i]);
+    return rom;
+}
+
+void testSaveStateIsDeterministic() {
+    const auto path = writeRomToTemp(makeCounterRom("COUNTER"), "reality64_state_a.z64");
+    Emulator emu;
+    std::string error;
+    CHECK_EQ(emu.loadRom(path.string(), error), true);
+    CHECK_EQ(emu.boot(error), true);
+
+    emu.run(100000);
+    const std::vector<uint8_t> snapshot = emu.saveState();
+    const uint64_t counterAtSave = emu.cpu().gpr(t0);
+
+    emu.run(50000);  // let it diverge from the snapshot
+    const uint64_t counterLater = emu.cpu().gpr(t0);
+    const uint64_t pcLater = emu.cpu().pc();
+    const uint64_t ramLater = emu.bus().read32(0x2000);
+    const uint64_t cyclesLater = emu.bus().cycles();
+    CHECK_EQ(counterLater > counterAtSave, true);
+
+    CHECK_EQ(emu.loadState(snapshot, error), true);
+    CHECK_EQ(emu.cpu().gpr(t0), counterAtSave);  // back at the snapshot
+
+    emu.run(50000);                              // the same 50000 instructions again
+    CHECK_EQ(emu.cpu().gpr(t0), counterLater);
+    CHECK_EQ(emu.cpu().pc(), pcLater);
+    CHECK_EQ(emu.bus().read32(0x2000), ramLater);
+    CHECK_EQ(emu.bus().cycles(), cyclesLater);
+
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+}
+
+void testSaveStateRejectsBadInput() {
+    const auto pathA = writeRomToTemp(makeCounterRom("GAME A"), "reality64_state_a2.z64");
+    const auto pathB = writeRomToTemp(makeCounterRom("GAME B"), "reality64_state_b.z64");
+    Emulator a, b;
+    std::string error;
+    CHECK_EQ(a.loadRom(pathA.string(), error) && a.boot(error), true);
+    CHECK_EQ(b.loadRom(pathB.string(), error) && b.boot(error), true);
+    a.run(1000);
+    std::vector<uint8_t> state = a.saveState();
+
+    CHECK_EQ(b.loadState(state, error), false);  // different game
+    CHECK_EQ(error.find("different game") != std::string::npos, true);
+
+    std::vector<uint8_t> truncated(state.begin(), state.end() - 100);
+    CHECK_EQ(a.loadState(truncated, error), false);
+    CHECK_EQ(error.find("truncated") != std::string::npos, true);
+
+    CHECK_EQ(a.loadState(std::vector<uint8_t>(64, 0xAB), error), false);  // garbage
+    CHECK_EQ(a.loadState(std::vector<uint8_t>{}, error), false);          // empty
+
+    CHECK_EQ(a.loadState(state, error), true);  // the real one still loads
+
+    std::error_code ec;
+    std::filesystem::remove(pathA, ec);
+    std::filesystem::remove(pathB, ec);
+}
+
+void testCyclesPerInstructionScalesTime() {
+    for (unsigned cpi : {1u, 2u, 4u}) {
+        Emulator emu;
+        emu.setCyclesPerInstruction(cpi);
+        const auto path = writeRomToTemp(makeCounterRom("CPI"), "reality64_cpi.z64");
+        std::string error;
+        CHECK_EQ(emu.loadRom(path.string(), error) && emu.boot(error), true);
+        emu.run(10000);
+        CHECK_EQ(emu.bus().cycles(), 10000ull * cpi);  // time advances in cycles
+        std::error_code ec;
+        std::filesystem::remove(path, ec);
+    }
+}
+
+void testForcedSixtyHertzForPal() {
+    std::vector<uint8_t> rom = makeCounterRom("PAL GAME");
+    rom[0x3E] = 'P';
+    const auto path = writeRomToTemp(rom, "reality64_pal60.z64");
+    std::string error;
+
+    Emulator real;
+    CHECK_EQ(real.loadRom(path.string(), error) && real.boot(error), true);
+    CHECK_EQ(real.isPal(), true);
+    CHECK_EQ(static_cast<int>(real.bus().frameRate()), 50);
+
+    Emulator forced;
+    forced.setForcedRefresh(60);
+    CHECK_EQ(forced.loadRom(path.string(), error) && forced.boot(error), true);
+    CHECK_EQ(forced.isPal(), true);                           // still reported as a PAL cart
+    CHECK_EQ(static_cast<int>(forced.bus().frameRate()), 60);  // but displayed at 60 Hz
+
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+}
+
 struct TestCase {
     const char* name;
     std::function<void()> fn;
@@ -1036,6 +1212,12 @@ int main() {
         {"sp dma + null rsp", testSpDmaAndNullRsp},
         {"audio dma", testAudioDmaDeliversSamplesAndInterrupts},
         {"framebuffer decode", testFramebufferDecoding},
+        {"settings round trip", testSettingsRoundTrip},
+        {"settings recent + errors", testSettingsRecentListIsCappedAndBadLinesReported},
+        {"save state determinism", testSaveStateIsDeterministic},
+        {"save state rejects bad input", testSaveStateRejectsBadInput},
+        {"cycles per instruction", testCyclesPerInstructionScalesTime},
+        {"forced 60 Hz for PAL", testForcedSixtyHertzForPal},
         {"guest draws via vi", testGuestProgramDrawsThroughVi},
         {"vi interrupt -> cpu", testViInterruptReachesTheCpu},
         {"crc32 + cic", testCrc32AndCicFallback},

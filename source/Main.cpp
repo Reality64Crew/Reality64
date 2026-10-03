@@ -37,6 +37,8 @@ struct Options {
     bool noLimit = false;
     bool fullscreen = false;
     bool stepsGiven = false;
+    int force60 = -1;  // -1 = not given
+    unsigned cpi = 0;  // 0 = not given
     uint64_t maxSteps = DefaultMaxSteps;
     uint64_t frames = 0;
 };
@@ -57,8 +59,10 @@ void printUsage(const char* argv0) {
 #ifdef REALITY64_SDL
         "  --fullscreen         start in fullscreen\n"
         "  --no-limit           do not pace to the console's refresh rate\n"
+        "  --force60 <on|off>   show every game at 60 Hz (PAL games run faster)\n"
         "  --headless           run without a window (for testing)\n"
 #endif
+        "  --cpi <n>            CPU speed model: cycles charged per instruction, 1-8 (default 2)\n"
         "  --input-config <f>   keyboard/gamepad bindings (default: ./input.cfg if present)\n"
         "  --info               print the ROM header and exit\n"
         "  --steps <n>          headless: stop after n CPU instructions (default %" PRIu64 ")\n"
@@ -69,7 +73,8 @@ void printUsage(const char* argv0) {
         "  -h, --help           show this help\n"
 #ifdef REALITY64_SDL
         "\n"
-        "Window keys: Esc back to the menu (quit from the menu), P pause, F11 fullscreen.\n"
+        "Window keys: Esc back to the menu (quit from the menu), P pause, F11 fullscreen,\n"
+        "F5/F7 save/load state, F12 screenshot, hold Tab to fast-forward.\n"
 #endif
         ,
         REALITY64_VERSION, argv0, DefaultMaxSteps);
@@ -150,6 +155,25 @@ int parseArgs(int argc, char* argv[], Options& opt) {
             opt.noLimit = true;
         } else if (arg == "--fullscreen") {
             opt.fullscreen = true;
+        } else if (arg == "--force60") {
+            const char* v = needValue("--force60");
+            if (!v) return 1;
+            const std::string value = v;
+            if (value == "on" || value == "1" || value == "true") opt.force60 = 1;
+            else if (value == "off" || value == "0" || value == "false") opt.force60 = 0;
+            else {
+                std::fprintf(stderr, "error: --force60 takes on or off, not '%s'\n", v);
+                return 1;
+            }
+        } else if (arg == "--cpi") {
+            const char* v = needValue("--cpi");
+            if (!v) return 1;
+            uint64_t n;
+            if (!parseUnsigned(v, n) || n < 1 || n > 8) {
+                std::fprintf(stderr, "error: --cpi must be a number from 1 to 8, not '%s'\n", v);
+                return 1;
+            }
+            opt.cpi = static_cast<unsigned>(n);
         } else if (arg == "--steps" || arg == "--frames") {
             const char* v = needValue(arg.c_str());
             if (!v) return 1;
@@ -232,6 +256,8 @@ int main(int argc, char* argv[]) {
         reality64::FrontendOptions fo;
         fo.frameLimit = !opt.noLimit;
         fo.fullscreen = opt.fullscreen;
+        fo.force60 = opt.force60;
+        fo.cyclesPerInstruction = opt.cpi;
         return reality64::runSdlFrontend(input, fo, opt.romPath);
     }
 #endif
@@ -251,6 +277,8 @@ int main(int argc, char* argv[]) {
     if (opt.infoOnly) return 0;
 
     emu.bus().setControllerProvider([&input](int port) { return input.state(port); });
+    if (opt.cpi) emu.setCyclesPerInstruction(opt.cpi);
+    if (opt.force60 > 0) emu.setForcedRefresh(60);
 
     if (!emu.boot(error)) {
         std::fprintf(stderr, "error: %s\n", error.c_str());

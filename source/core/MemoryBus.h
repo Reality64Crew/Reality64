@@ -6,7 +6,9 @@
 #include <memory>
 #include <vector>
 
+#include "core/Endian.h"
 #include "core/Pif.h"
+#include "core/StateIO.h"
 #include "core/Rom.h"
 #include "core/Video.h"
 
@@ -55,14 +57,11 @@ public:
         if (paddr < RdramSize && size <= RdramSize - paddr) {
             const uint8_t* p = rdram_.data() + paddr;
             switch (size) {
-                case 4:
-                    return (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) | (uint32_t(p[2]) << 8) | p[3];
-                case 1:
-                    return p[0];
-                case 2:
-                    return (uint32_t(p[0]) << 8) | p[1];
-                default:
-                    break;
+                case 4: return loadBe32(p);
+                case 1: return p[0];
+                case 2: return loadBe16(p);
+                case 8: return loadBe64(p);
+                default: break;
             }
         }
         return readSlow(paddr, size);
@@ -71,21 +70,11 @@ public:
         if (paddr < RdramSize && size <= RdramSize - paddr) {
             uint8_t* p = rdram_.data() + paddr;
             switch (size) {
-                case 4:
-                    p[0] = static_cast<uint8_t>(value >> 24);
-                    p[1] = static_cast<uint8_t>(value >> 16);
-                    p[2] = static_cast<uint8_t>(value >> 8);
-                    p[3] = static_cast<uint8_t>(value);
-                    return;
-                case 1:
-                    p[0] = static_cast<uint8_t>(value);
-                    return;
-                case 2:
-                    p[0] = static_cast<uint8_t>(value >> 8);
-                    p[1] = static_cast<uint8_t>(value);
-                    return;
-                default:
-                    break;
+                case 4: storeBe32(p, static_cast<uint32_t>(value)); return;
+                case 1: p[0] = static_cast<uint8_t>(value); return;
+                case 2: storeBe16(p, static_cast<uint16_t>(value)); return;
+                case 8: storeBe64(p, value); return;
+                default: break;
             }
         }
         writeSlow(paddr, size, value);
@@ -112,7 +101,8 @@ public:
     uint64_t frameCount() const { return frameCount_; }
     uint64_t cycles() const { return cycles_; }
 
-    void setVideoStandard(bool pal);
+    // refreshHz overrides the region default (50 for PAL, 60 for NTSC) when non-zero.
+    void setVideoStandard(bool pal, unsigned refreshHz = 0);
     double frameRate() const { return static_cast<double>(CpuClockHz) / static_cast<double>(frameCycles_); }
 
     // Decodes the framebuffer the VI is displaying. False if video is off.
@@ -122,6 +112,10 @@ public:
     void setAudioSink(AudioSink sink) { audioSink_ = std::move(sink); }
 
     uint64_t unmappedAccesses() const { return unmappedAccesses_; }
+
+    // Everything but the cartridge and the host callbacks.
+    void saveState(StateWriter& w) const;
+    void loadState(StateReader& r);
     uint64_t rspStartRequests() const { return rspStartRequests_; }
 
 private:

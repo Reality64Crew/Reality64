@@ -73,7 +73,7 @@ bool Emulator::boot(std::string& error) {
 
     bus_.resetDevices();
     bus_.applyBootRegisterState();
-    bus_.setVideoStandard(pal_);
+    bus_.setVideoStandard(pal_, forcedRefreshHz_);
     std::memset(bus_.rdram(), 0, MemoryBus::RdramSize);
 
     // The PIF puts the first 4 KiB of the cart into SP DMEM...
@@ -101,10 +101,12 @@ uint64_t Emulator::execute(uint64_t maxSteps, bool untilFrame) {
     uint64_t executed = 0;
     const uint64_t startFrame = bus_.frameCount();
     while (executed < maxSteps && !cpu_.halted()) {
-        const uint64_t slice = std::min(maxSteps - executed, bus_.cyclesUntilNextEvent());
+        const uint64_t cpi = cpu_.cyclesPerInstruction();
+        // The bus reports time in cycles; run that many instructions' worth.
+        const uint64_t slice = std::min(maxSteps - executed, std::max<uint64_t>(1, bus_.cyclesUntilNextEvent() / cpi));
         const uint64_t done = cpu_.run(slice);
         executed += done;
-        bus_.advance(done);
+        bus_.advance(done * cpi);
         if (untilFrame && bus_.frameCount() != startFrame) break;
     }
     return executed;
@@ -114,7 +116,74 @@ uint64_t Emulator::run(uint64_t maxSteps) { return execute(maxSteps, false); }
 
 uint64_t Emulator::runFrame() {
     // Two frames' worth of cycles is a safety net if the VI never wraps.
-    return execute(2 * (MemoryBus::CpuClockHz / 50), true);
+    return execute(2 * (MemoryBus::CpuClockHz / 50) / cpu_.cyclesPerInstruction(), true);
+}
+
+namespace {
+
+constexpr uint32_t StateMagic = 0x53343652;     // "R64S"
+constexpr uint32_t StateEndMagic = 0x45343652;  // "R64E"
+constexpr uint32_t StateVersion = 1;
+
+}  // namespace
+
+std::vector<uint8_t> Emulator::saveState() const {
+    StateWriter w;
+    w.u32(StateMagic);
+    w.u32(StateVersion);
+    if (rom_) {
+        w.u32(rom_->header().crc1);
+        w.u32(rom_->header().crc2);
+        w.string(rom_->header().name);
+    } else {
+        w.u32(0);
+        w.u32(0);
+        w.string("");
+    }
+    w.u32(static_cast<uint32_t>(cic_));
+    w.boolean(pal_);
+    cpu_.saveState(w);
+    bus_.saveState(w);
+    w.u32(StateEndMagic);
+    return w.take();
+}
+
+bool Emulator::loadState(const std::vector<uint8_t>& data, std::string& error) {
+    StateReader r(data.data(), data.size());
+    if (r.u32() != StateMagic) {
+        error = "this is not a Reality64 save state";
+        return false;
+    }
+    if (r.u32() != StateVersion) {
+        error = "this save state was made by an incompatible version";
+        return false;
+    }
+    const uint32_t crc1 = r.u32();
+    const uint32_t crc2 = r.u32();
+    const std::string name = r.string();
+    if (!rom_ || crc1 != rom_->header().crc1 || crc2 != rom_->header().crc2 || name != rom_->header().name) {
+        error = "this save state belongs to a different game";
+        return false;
+    }
+
+    // The footer is checked before anything is applied, so a truncated file
+    // cannot leave the machine half-restored.
+    if (data.size() < 4 || StateReader(data.data() + data.size() - 4, 4).u32() != StateEndMagic) {
+        error = "the save state file is truncated or damaged";
+        return false;
+    }
+
+    const uint32_t cic = r.u32();
+    const bool pal = r.boolean();
+    cpu_.loadState(r);
+    bus_.loadState(r);
+    if (!r.ok() || r.u32() != StateEndMagic) {
+        error = "the save state file is damaged";
+        return false;
+    }
+    cic_ = static_cast<Cic>(cic);
+    pal_ = pal;
+    return true;
 }
 
 }  // namespace reality64
